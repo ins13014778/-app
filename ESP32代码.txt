@@ -1,0 +1,310 @@
+#include <WiFi.h> 
+#include <PubSubClient.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <SimpleTimer.h>
+#include <ESP32Servo.h>  // ===== 舵机库 =====
+
+/* ===== WiFi & MQTT ===== */
+const char* ssid        = "";
+const char* password    = "czp123456";
+const char* mqtt_server = "bemfa.com";
+const int   mqtt_port   = 9501;
+const String UID        = ""; // 你的私钥
+const char* UserName    = "";
+const char* PassWord    = "";
+
+/* ===== 引脚定义 ===== */
+#define dht11Pin   4
+#define ledPin     12
+#define buzzerPin  15
+#define INAPin     18
+#define INBPin     19
+#define soilPin    33
+#define waterPin   34
+#define lightPin   35
+
+// 舵机引脚（P13、P14）
+#define SERVO1_PIN 13
+#define SERVO2_PIN 14
+
+/* ===== 主题 ===== */
+// 数据上报
+const char* T_TEM   = "tem";
+const char* T_HUM   = "hum";
+const char* T_LIGHT = "light";
+const char* T_SOIL  = "soil";
+const char* T_WATER = "water";
+// 控制
+const char* T_PUMP   = "pump";
+const char* T_AUTO   = "auto";
+const char* T_LED    = "ledctrl";
+const char* T_BUZZ   = "buzzerctrl";
+const char* T_LCD    = "lcd1602";
+
+// 舵机控制主题
+const char* T_SERVO1 = "duoji1";
+const char* T_SERVO2 = "duoji2";
+
+/* ===== 对象与变量 ===== */
+WiFiClient espClient;
+PubSubClient client(espClient);
+DHT dht(dht11Pin, DHT11);
+LiquidCrystal_I2C lcd(0x27,16,2);
+SimpleTimer timer;
+
+Servo servo1;
+Servo servo2;
+bool servo1On = false;
+bool servo2On = false;
+
+bool  autoState = false;   // 自动模式开关
+int   Light;
+float Water, data, Humi, Temp, Soil, i, j;
+
+/* ===== 小工具 ===== */
+bool isOn (String s){ s.toLowerCase(); return (s=="on" || s=="1" || s=="pump_on"); }
+bool isOff(String s){ s.toLowerCase(); return (s=="off"|| s=="0" || s=="pump_off"); }
+
+void pumpOn()  { 
+  analogWrite(INAPin, 0);   
+  analogWrite(INBPin, 255); 
+  Serial.println("[PUMP] ON");  
+}
+void pumpOff() { 
+  analogWrite(INAPin,255);  
+  analogWrite(INBPin,255);  
+  Serial.println("[PUMP] OFF"); 
+}
+
+/* ===== WiFi/MQTT 连接 ===== */
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected. IP: " + WiFi.localIP().toString());
+}
+
+void subscribeAll(){
+  client.subscribe(T_PUMP);
+  client.subscribe(T_AUTO);
+  client.subscribe(T_LED);
+  client.subscribe(T_BUZZ);
+  client.subscribe(T_LCD);
+  client.subscribe(T_SERVO1);   // 订阅舵机1
+  client.subscribe(T_SERVO2);   // 订阅舵机2
+  Serial.println("[SUB] pump/auto/led/buzzer/lcd/servo1/servo2");
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect(UID.c_str(), UserName, PassWord)) {
+      Serial.println("connected");
+      subscribeAll();
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 1s");
+      delay(1000);
+    }
+  }
+}
+
+/* ===== MQTT 回调 ===== */
+void callback(char* rtopic, byte* payload, unsigned int length) {
+  String topic = rtopic, msg;
+  for (unsigned i=0;i<length;i++) msg += (char)payload[i];
+  msg.trim();
+  Serial.printf("[MSG] %s => %s\n", topic.c_str(), msg.c_str());
+
+  if (topic == T_PUMP){
+    if (isOn(msg))  pumpOn();
+    if (isOff(msg)) pumpOff();
+  }
+  else if (topic == T_AUTO){
+    if (msg=="auto_on")  { 
+      autoState = true;  
+      Serial.println("[AUTO] ON"); 
+    }
+    if (msg=="auto_off") {
+      autoState = false;
+      pumpOff();
+      digitalWrite(ledPin, LOW);
+      digitalWrite(buzzerPin, LOW);
+      Serial.println("[AUTO] OFF (all stopped)");
+    }
+  }
+  else if (topic == T_LED){
+    if (isOn(msg))  { digitalWrite(ledPin, HIGH); Serial.println("[LED] ON"); }
+    if (isOff(msg)) { digitalWrite(ledPin, LOW ); Serial.println("[LED] OFF"); }
+  }
+  else if (topic == T_BUZZ){
+    if (isOn(msg))  { digitalWrite(buzzerPin, HIGH); Serial.println("[BUZZ] ON"); }
+    if (isOff(msg)) { digitalWrite(buzzerPin, LOW );  Serial.println("[BUZZ] OFF"); }
+  }
+  else if (topic == T_LCD){
+    if (msg.equalsIgnoreCase("clear")) { lcd.clear(); return; }
+    if (msg.equalsIgnoreCase("bl:on")) { lcd.backlight(); return; }
+    if (msg.equalsIgnoreCase("bl:off")){ lcd.noBacklight(); return; }
+    int p = msg.indexOf('|');
+    lcd.clear();
+    lcd.setCursor(0,0); lcd.print(p>=0 ? msg.substring(0,p) : msg);
+    if (p>=0){
+      lcd.setCursor(0,1);
+      lcd.print(msg.substring(p+1));
+    }
+  }
+  // ===== 舵机1 控制 =====
+  else if (topic == T_SERVO1){
+    if (msg.equalsIgnoreCase("on")){
+      servo1.write(90);
+      servo1On = true;
+      Serial.println("[SERVO1] ON (90 deg)");
+    } else if (msg.equalsIgnoreCase("off")){
+      servo1.write(0);
+      servo1On = false;
+      Serial.println("[SERVO1] OFF (0 deg)");
+    }
+  }
+  // ===== 舵机2 控制：方向反转，默认关 =====
+  else if (topic == T_SERVO2){
+    if (msg.equalsIgnoreCase("on")){
+      servo2.write(0);   // 反向逻辑，on = 0°
+      servo2On = true;
+      Serial.println("[SERVO2] ON (反向 0 deg)");
+    } else if (msg.equalsIgnoreCase("off")){
+      servo2.write(90);  // 反向逻辑，off = 90°
+      servo2On = false;
+      Serial.println("[SERVO2] OFF (反向 90 deg)");
+    }
+  }
+}
+
+/* ===== 数据上报 ===== */
+void publish_sensor_data() {
+  if (!isnan(Temp)) client.publish(T_TEM,   String(Temp).c_str());
+  if (!isnan(Humi)) client.publish(T_HUM,   String(Humi).c_str());
+  client.publish(T_LIGHT, String(Light).c_str());
+  client.publish(T_SOIL,  String(j).c_str());
+  client.publish(T_WATER, String(data).c_str());
+  Serial.printf("[PUB] L=%d W=%.2f S=%.1f | T=%.1f H=%.1f\n", Light, data, j, Temp, Humi);
+}
+
+/* ===== LCD ===== */
+void LcdWelcome() {
+  lcd.init(); lcd.backlight();
+  lcd.setCursor(1,0); lcd.print("Automatic watering");
+  lcd.setCursor(1,1); lcd.print("Let's do it!");
+  delay(1000);
+  lcd.clear();
+}
+
+void Display(){
+  lcd.setCursor(0,0); lcd.print("T:"); lcd.print(Temp);
+  lcd.setCursor(8,0); lcd.print("H:"); lcd.print(Humi);
+  lcd.setCursor(0,1); lcd.print("L:"); lcd.print(Light); lcd.print("   ");
+  lcd.setCursor(8,1); lcd.print("S:"); lcd.print(j,1); lcd.print("%");
+  delay(500);
+}
+
+/* ===== 自动控制 ===== */
+// 灯：光线暗就开灯
+void lightAuto(){
+  if (Light > 500) digitalWrite(ledPin, LOW);
+  else             digitalWrite(ledPin, HIGH);
+}
+
+// 光照>1000 且土壤湿度>10 → 开泵
+void soilAuto(){
+  if (Light > 1000 && j > 10) {
+    pumpOn();
+    digitalWrite(buzzerPin, LOW);
+    Serial.println("[AUTO] Pump ON (Light>1000 & Soil>10)");
+  } else {
+    pumpOff();
+    digitalWrite(buzzerPin, LOW);
+    Serial.println("[AUTO] Pump OFF (Condition not met)");
+  }
+}
+
+/* ===== IO 初始化 ===== */
+void IO_Init(){
+  pinMode(lightPin,INPUT);
+  pinMode(soilPin ,INPUT);
+  pinMode(dht11Pin,INPUT);
+  pinMode(waterPin,INPUT);
+  pinMode(ledPin,OUTPUT); 
+  pinMode(buzzerPin,OUTPUT);  
+  pinMode(INAPin,OUTPUT);
+  pinMode(INBPin,OUTPUT);
+  digitalWrite(ledPin,LOW);
+  pumpOff();
+  digitalWrite(buzzerPin,LOW);
+}
+
+/* ===== 舵机初始化 ===== */
+void Servo_Init() {
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  servo1.setPeriodHertz(50);
+  servo2.setPeriodHertz(50);
+  servo1.attach(SERVO1_PIN, 500, 2400);
+  servo2.attach(SERVO2_PIN, 500, 2400);
+
+  // 舵机1默认关
+  servo1.write(0);      
+  servo1On = false;
+
+  // ★ 舵机2默认关（你要求的）
+  servo2.write(90);  // 因为反向逻辑里 off=90°
+  servo2On = false;
+  Serial.println("[SERVO2] default OFF (反向 90 deg)");
+}
+
+/* ===== setup / loop ===== */
+void setup(){
+  Serial.begin(9600);
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  reconnect();
+
+  dht.begin();
+  IO_Init();
+  Servo_Init();
+  LcdWelcome();
+
+  timer.setInterval(500L, publish_sensor_data);
+}
+
+void loop(){
+  Temp  = dht.readTemperature();
+  Humi  = dht.readHumidity();
+  Light = analogRead(lightPin);
+  Soil  = analogRead(soilPin);
+  i     = Soil/4095.0;
+  j     = (1 - i) * 100.0;
+  Water = analogRead(waterPin);
+  data  = (Water/1600.0)*4.0;
+
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  timer.run();
+  Display();
+
+  if (autoState){
+    lightAuto();
+    soilAuto();
+  }
+}
