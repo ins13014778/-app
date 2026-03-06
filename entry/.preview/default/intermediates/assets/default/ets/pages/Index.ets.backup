@@ -1,0 +1,3502 @@
+import { apiService, LoginRequest, RegisterRequest, SensorDataUploadRequest } from '../services/ApiService';
+import { mqttService, MqttStatus, MqttMessage } from '../services/MqttService';
+import { bemfaCloudService, TopicDetail, MessageRecord } from '../services/BemfaCloudService';
+import cozeService from '../services/CozeService';
+import { BemfaConfig } from '../config/BemfaConfig';
+import { router } from '@kit.ArkUI';
+import { common } from '@kit.AbilityKit';
+import { preferences } from '@kit.ArkData';
+
+// 控制设备接口定义（替代原灌溉设备）
+interface ControlDevice {
+  id: number;
+  name: string;
+  topic: string; // MQTT主题
+  isActive: boolean;
+  isOnline: boolean; // 在线状态
+  area: string;
+  deviceType: string; // 设备类型
+}
+
+// 分析数据接口定义
+interface AnalysisData {
+  date: string;
+  temperature: number;
+  humidity: number;
+  soilMoisture: number;
+  yield: number;
+}
+
+// AI消息接口
+interface AIMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: number;
+}
+
+// 用户信息接口定义
+interface UserProfile {
+  id: number;
+  avatar: string;
+  username: string;
+  phone: string;
+  email: string;
+  bio: string;
+  user_mode: string;
+  is_admin?: number; // ✅ 添加管理员标识
+}
+
+// 菜单项接口定义
+interface ProfileMenuItem {
+  id: string;
+  title: string;
+  icon: string;
+  hasArrow: boolean;
+}
+
+@Entry
+@Component
+struct Index {
+  // 农场数据状态（初始值为0，等待传感器实时数据）
+  @State soilHumidity: number = 0;
+  @State temperature: number = 0;
+  @State lightIntensity: number = 0;
+  // 日期显示
+  @State date: string = '10月10日';
+  // 系统状态（已改为动态计算，无需状态变量）
+
+  // 当前选中的标签页
+  @State currentIndex: number = 0;
+  // 登录注册状态管理
+  @State isLoggedIn: boolean = false;
+  @State userMode: string = 'not_logged_in'; // 'not_logged_in', 'guest', 'logged_in'
+  @State currentView: string = 'login'; // 'login', 'register', 'main'
+  @State username: string = '';
+  @State password: string = '';
+  @State confirmPassword: string = '';
+  @State email: string = '';
+  @State phone: string = '';
+  @State isLoading: boolean = false;
+  @State errorMessage: string = '';
+  @State successMessage: string = '';
+  // 用户信息状态
+  @State userProfile: UserProfile = {
+    id: 0,
+    username: '',
+    email: '',
+    phone: '',
+    avatar: '👤',
+    bio: '智慧农业用户',
+    user_mode: 'not_logged_in',
+    is_admin: 0  // ✅ 默认为普通用户
+  };
+  // 控制设备状态管理（动态加载，不再硬编码）
+  @State controlDevices: ControlDevice[] = [];
+  @State activeDeviceCount: number = 0;
+  @State onlineDeviceCount: number = 0;
+  // MQTT连接状态
+  @State mqttStatus: MqttStatus = MqttStatus.DISCONNECTED;
+  @State mqttStatusText: string = '未连接';
+  @State bemfaUID: string = ''; // 巴法云UID
+  // 修改昵称对话框状态
+  @State showEditNameDialog: boolean = false;
+  @State editingDevice: ControlDevice | null = null;
+  @State newDeviceName: string = '';
+  // 🔥 AI聊天相关状态变量
+  @State aiMessages: AIMessage[] = [];
+  @State aiInputText: string = '';
+  @State isAILoading: boolean = false;
+  @State aiQuickQuestions: string[] = [];
+  private aiChatScroller: Scroller = new Scroller();
+  // 分析数据状态管理（简化版 - 用于演示）
+  @State analysisData: AnalysisData[] = [];
+  @State selectedDataType: string = '温度';
+  @State lastUpdateTime: string = '--:--'; // 最后更新时间
+  // 今日数据统计
+  @State todayMaxTemp: number = 0; // 今日最高温度
+  @State todayMinTemp: number = 0; // 今日最低温度
+  @State todayMaxHumidity: number = 0; // 今日最高湿度
+  @State todayMinHumidity: number = 0; // 今日最低湿度
+  // 历史消息相关状态
+  @State selectedDeviceForHistory: string = ''; // 选中查看历史的设备主题
+  @State historyMessages: MessageRecord[] = []; // 历史消息列表
+  @State isLoadingHistory: boolean = false; // 是否正在加载历史消息
+  // 定时器ID
+  private dateTimerID: number = -1;
+  private dataRefreshTimerID: number = -1;
+  private sensorDataRefreshTimerID: number = -1;
+
+  // 页面生命周期 - 页面即将显示
+  aboutToAppear() {
+    console.info('[Index] 页面即将显示');
+    // 设置API服务的context
+    apiService.setContext(this.getUIContext().getHostContext() as common.UIAbilityContext);
+    // 从本地存储加载巴法云UID
+    this.loadBemfaUID();
+
+    // 启动定时器更新日期
+    this.updateDateTime();
+    this.dateTimerID = setInterval(() => {
+      this.updateDateTime();
+    }, 60000); // 每分钟更新一次
+
+    // 启动定时器刷新设备在线状态（每30秒）
+    this.dataRefreshTimerID = setInterval(() => {
+      if (this.controlDevices.length > 0) {
+        this.refreshDeviceOnlineStatus();
+      }
+    }, 30000);
+
+    // 启动定时器刷新传感器数据（每10秒）
+    this.sensorDataRefreshTimerID = setInterval(() => {
+      if (this.controlDevices.length > 0) {
+        this.refreshSensorData();
+      }
+    }, 10000);
+
+    // 🔥 初始化AI服务
+    this.initAIService();
+  }
+
+  // 页面生命周期 - 页面即将销毁
+  aboutToDisappear() {
+    console.info('[Index] 页面即将销毁');
+    // 清除定时器
+    if (this.dateTimerID !== -1) {
+      clearInterval(this.dateTimerID);
+    }
+    if (this.dataRefreshTimerID !== -1) {
+      clearInterval(this.dataRefreshTimerID);
+    }
+    if (this.sensorDataRefreshTimerID !== -1) {
+      clearInterval(this.sensorDataRefreshTimerID);
+    }
+    // 断开MQTT连接
+    mqttService.disconnect();
+  }
+
+  // 更新日期时间
+  updateDateTime() {
+    const now = new Date();
+    const month = now.getMonth() + 1;
+    const day = now.getDate();
+    this.date = `${month}月${day}日`;
+    console.info('[Index] 日期更新:', this.date);
+  }
+
+  // 从本地存储加载UID
+  async loadBemfaUID() {
+    try {
+      // 优先使用配置文件中的默认UID
+      if (BemfaConfig.USER_UID && BemfaConfig.USER_UID.length > 0) {
+        this.bemfaUID = BemfaConfig.USER_UID;
+        bemfaCloudService.setUID(this.bemfaUID);
+        console.info('[Index] 使用内置UID:', this.bemfaUID.substring(0, 8) + '...');
+
+        // 自动同步设备列表
+        await this.syncDevicesFromBemfa();
+
+        // 然后连接MQTT
+        await this.initMQTT();
+        return;
+      }
+      // 如果配置文件没有，则从本地存储读取
+      let pref =
+        await preferences.getPreferences(this.getUIContext().getHostContext() as common.UIAbilityContext, 'app_config');
+      let savedUID: string = await pref.get(BemfaConfig.STORAGE_KEY_UID, '') as string;
+
+      if (savedUID && typeof savedUID === 'string') {
+        this.bemfaUID = savedUID as string;
+        bemfaCloudService.setUID(this.bemfaUID);
+        console.info('[Index] 已加载保存的UID');
+
+        // 自动同步设备列表
+        await this.syncDevicesFromBemfa();
+
+        // 然后连接MQTT
+        await this.initMQTT();
+      } else {
+        console.warn('[Index] UID未配置，请在控制页面配置');
+      }
+    } catch (error) {
+      console.error('[Index] 加载UID失败:', error);
+    }
+  }
+
+  // 保存UID到本地存储和云端
+  async saveBemfaUID(uid: string): Promise<void> {
+    try {
+      // 1. 保存到本地
+      let pref =
+        await preferences.getPreferences(this.getUIContext().getHostContext() as common.UIAbilityContext, 'app_config');
+      await pref.put(BemfaConfig.STORAGE_KEY_UID, uid);
+      await pref.flush();
+
+      this.bemfaUID = uid;
+      bemfaCloudService.setUID(uid);
+      console.info('[Index] UID已保存到本地');
+
+      // 2. 如果用户已登录，保存到云端
+      if (this.isLoggedIn && apiService.hasToken()) {
+        try {
+          const result = await apiService.saveUserConfig({ bemfa_uid: uid });
+          if (result.success) {
+            console.info('[Index] UID已同步到云端');
+          } else {
+            console.warn('[Index] UID云端同步失败（不影响使用）:', result.message);
+          }
+        } catch (error) {
+          console.warn('[Index] UID云端同步异常（不影响使用）:', error);
+        }
+      }
+
+      // 3. 保存成功后自动同步设备并连接MQTT
+      await this.syncDevicesFromBemfa();
+      await this.initMQTT();
+    } catch (error) {
+      console.error('[Index] 保存UID失败:', error);
+    }
+  }
+
+  build() {
+    Stack() {
+      if (this.userMode === 'not_logged_in') {
+        // 未登录状态，显示登录或注册界面
+        if (this.currentView === 'login') {
+          this.LoginPageContent()
+        } else if (this.currentView === 'register') {
+          this.RegisterPageContent()
+        }
+      } else {
+        // 已登录或游客模式，显示主应用界面
+        // 使用Tabs作为主容器，底部导航栏
+        Tabs({ barPosition: BarPosition.End, index: this.currentIndex }) {
+          // 首页标签页
+          TabContent() {
+            this.HomePageContent()
+          }.tabBar(this.TabBuilder('首页', 0))
+
+          // 控制页面标签页
+          TabContent() {
+            this.ControlPageContent()
+          }.tabBar(this.TabBuilder('控制', 1))
+
+          // 分析页面标签页
+          TabContent() {
+            this.AnalysisPageContent()
+          }.tabBar(this.TabBuilder('分析', 2))
+
+          // 用户页面标签页
+          TabContent() {
+            this.ProfilePageContent()
+          }.tabBar(this.TabBuilder('我的', 3))
+        }
+        .onChange((index: number) => {
+          this.currentIndex = index;
+        })
+        .width('100%')
+        .height('100%')
+        .padding(0)
+        .margin(0)
+        .backgroundColor('#F5F5F5')
+      }
+
+      // 编辑设备昵称对话框
+      if (this.showEditNameDialog) {
+        this.EditDeviceNameDialog()
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .padding(0)
+    .margin(0)
+    .alignContent(Alignment.TopStart)
+  }
+
+  // 编辑设备昵称对话框
+  @Builder
+  EditDeviceNameDialog() {
+    Column() {
+      // 遮罩层
+      Column()
+        .width('100%')
+        .height('100%')
+        .backgroundColor('#80000000')
+        .onClick(() => {
+          this.showEditNameDialog = false;
+        })
+
+      // 对话框内容
+      Column() {
+        // 标题
+        Text('修改设备昵称')
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .margin({ bottom: 20 })
+
+        // 设备信息
+        if (this.editingDevice) {
+          Column() {
+            Row() {
+              Text('主题:')
+                .fontSize(14)
+                .fontColor('#666666')
+                .width(60)
+              Text(this.editingDevice.topic)
+                .fontSize(14)
+                .fontColor('#333333')
+            }
+            .width('100%')
+            .margin({ bottom: 8 })
+
+            Row() {
+              Text('类型:')
+                .fontSize(14)
+                .fontColor('#666666')
+                .width(60)
+              Text(this.editingDevice.deviceType)
+                .fontSize(14)
+                .fontColor('#333333')
+            }
+            .width('100%')
+            .margin({ bottom: 16 })
+          }
+          .alignItems(HorizontalAlign.Start)
+        }
+
+        // 输入框
+        Column() {
+          Text('新昵称')
+            .fontSize(14)
+            .fontColor('#666666')
+            .alignSelf(ItemAlign.Start)
+            .margin({ bottom: 8 })
+
+          TextInput({ text: this.newDeviceName })
+            .width('100%')
+            .height(44)
+            .fontSize(16)
+            .borderRadius(8)
+            .backgroundColor('#F5F5F5')
+            .onChange((value: string) => {
+              this.newDeviceName = value;
+            })
+        }
+        .margin({ bottom: 24 })
+
+        // 按钮组
+        Row() {
+          Button('取消')
+            .fontSize(16)
+            .fontColor('#666666')
+            .backgroundColor('#F5F5F5')
+            .borderRadius(8)
+            .layoutWeight(1)
+            .height(44)
+            .onClick(() => {
+              this.showEditNameDialog = false;
+            })
+
+          Button('确定')
+            .fontSize(16)
+            .fontColor('#FFFFFF')
+            .backgroundColor('#007DFF')
+            .borderRadius(8)
+            .layoutWeight(1)
+            .height(44)
+            .margin({ left: 12 })
+            .onClick(() => {
+              this.confirmEditDeviceName();
+            })
+        }
+        .width('100%')
+      }
+      .width('85%')
+      .padding(24)
+      .backgroundColor('#FFFFFF')
+      .borderRadius(16)
+      .position({ x: '7.5%', y: '30%' })
+    }
+    .width('100%')
+    .height('100%')
+    .position({ x: 0, y: 0 })
+    .zIndex(1000)
+  }
+
+  // 首页内容组件
+  @Builder
+  HomePageContent() {
+    Flex({ direction: FlexDirection.Column, justifyContent: FlexAlign.Start }) {
+      // 顶部导航栏 - 紧凑版
+      Row() {
+        Text('智慧农场监测')
+          .fontSize(18)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#1F2329')
+          .layoutWeight(1)
+
+        // AI聊天按钮
+        Button({ type: ButtonType.Normal }) {
+          Row() {
+            Image($rawfile('deepseek-copy-copy-copy.png'))
+              .width(16)
+              .height(16)
+              .fillColor('#666666')
+              .margin({ right: 4 })
+            Text('AI')
+              .fontSize(13)
+              .fontColor('#666666')
+          }
+        }
+        .backgroundColor('#F5F5F5')
+        .borderRadius(16)
+        .height(32)
+        .padding({ left: 12, right: 12 })
+        .margin({ right: 6 })
+        .onClick(() => {
+          router.pushUrl({
+            url: 'pages/AIChat'
+          }).catch((err: Error) => {
+            console.error('[Index] 跳转AI聊天失败:', JSON.stringify(err));
+          });
+        })
+      }
+      .width('100%')
+      .height(50)
+      .padding({ left: 12, right: 12 })
+      .backgroundColor('#FFFFFF')
+      .flexShrink(0)
+
+      // 内容区域 - 使用 Scroll 自适应剩余空间
+      Scroll() {
+        Column() {
+          // 实时数据标题栏
+          Row() {
+            Text('实时数据')
+              .fontSize(16)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#1F2329')
+              .layoutWeight(1)
+
+            if (this.lastUpdateTime !== '--:--') {
+              Text(`更新于 ${this.lastUpdateTime}`)
+                .fontSize(11)
+                .fontColor('#8A8F99')
+            }
+          }
+          .width('100%')
+          .padding({
+            left: 12,
+            right: 12,
+            top: 0,
+            bottom: 4
+          })
+          .margin({ top: 0 })
+
+          // 数据卡片 - 紧凑版
+          Row() {
+            // 土壤湿度
+            Column() {
+              Image($rawfile('土壤湿度.png'))
+                .width(32)
+                .height(32)
+                .fillColor('#00B75E')
+
+              Text(this.soilHumidity > 0 ? `${this.soilHumidity}%` : '--')
+                .fontSize(22)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(this.soilHumidity > 0 ? '#00B75E' : '#CCCCCC')
+                .margin({ top: 6 })
+
+              Text('土壤湿度')
+                .fontSize(12)
+                .fontColor('#8A8F99')
+                .margin({ top: 4 })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Center)
+            .padding(16)
+            .backgroundColor('#FFFFFF')
+            .borderRadius(12)
+
+            // 环境温度
+            Column() {
+              Image($rawfile('环境温度.png'))
+                .width(32)
+                .height(32)
+                .fillColor('#E34607')
+
+              Text(this.temperature > 0 ? `${this.temperature}°C` : '--')
+                .fontSize(22)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(this.temperature > 0 ? '#E34607' : '#CCCCCC')
+                .margin({ top: 6 })
+
+              Text('环境温度')
+                .fontSize(12)
+                .fontColor('#8A8F99')
+                .margin({ top: 4 })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Center)
+            .padding(16)
+            .backgroundColor('#FFFFFF')
+            .borderRadius(12)
+            .margin({ left: 8, right: 8 })
+
+            // 光照强度
+            Column() {
+              Image($rawfile('光照强度-copy.png'))
+                .width(32)
+                .height(32)
+                .fillColor('#FFA726')
+
+              Text(this.lightIntensity > 0 ? `${this.lightIntensity}Lx` : '--')
+                .fontSize(22)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(this.lightIntensity > 0 ? '#FFA726' : '#CCCCCC')
+                .margin({ top: 6 })
+
+              Text('光照强度')
+                .fontSize(12)
+                .fontColor('#8A8F99')
+                .margin({ top: 4 })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Center)
+            .padding(16)
+            .backgroundColor('#FFFFFF')
+            .borderRadius(12)
+          }
+          .width('100%')
+          .padding({ left: 12, right: 12 })
+          .margin({ top: 0, bottom: 8 })
+
+          // 今日数据统计
+          Column() {
+            Row() {
+              Text('今日数据统计')
+                .fontSize(16)
+                .fontWeight(FontWeight.Bold)
+                .fontColor('#1F2329')
+                .layoutWeight(1)
+
+              Text(this.date)
+                .fontSize(12)
+                .fontColor('#8A8F99')
+            }
+            .width('100%')
+            .margin({ bottom: 12 })
+
+            // 温度统计
+            Row() {
+              Column() {
+                Text('最高温度')
+                  .fontSize(12)
+                  .fontColor('#666666')
+                  .margin({ bottom: 4 })
+                Text(this.todayMaxTemp > 0 ? `${this.todayMaxTemp}°C` : '--')
+                  .fontSize(18)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor('#FF5722')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Center)
+
+              Column() {
+                Text('当前温度')
+                  .fontSize(12)
+                  .fontColor('#666666')
+                  .margin({ bottom: 4 })
+                Text(this.temperature > 0 ? `${this.temperature}°C` : '--')
+                  .fontSize(18)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.temperature > 0 ? '#FF6B35' : '#CCCCCC')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Center)
+
+              Column() {
+                Text('最低温度')
+                  .fontSize(12)
+                  .fontColor('#666666')
+                  .margin({ bottom: 4 })
+                Text(this.todayMinTemp > 0 ? `${this.todayMinTemp}°C` : '--')
+                  .fontSize(18)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.todayMinTemp > 0 ? '#2196F3' : '#CCCCCC')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Center)
+            }
+            .width('100%')
+            .padding(12)
+            .backgroundColor('#FFF3E0')
+            .borderRadius(8)
+            .margin({ bottom: 10 })
+
+            // 湿度统计
+            Row() {
+              Column() {
+                Text('最高湿度')
+                  .fontSize(12)
+                  .fontColor('#666666')
+                  .margin({ bottom: 4 })
+                Text(this.todayMaxHumidity > 0 ? `${this.todayMaxHumidity}%` : '--')
+                  .fontSize(18)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.todayMaxHumidity > 0 ? '#4CAF50' : '#CCCCCC')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Center)
+
+              Column() {
+                Text('当前湿度')
+                  .fontSize(12)
+                  .fontColor('#666666')
+                  .margin({ bottom: 4 })
+                Text(this.soilHumidity > 0 ? `${this.soilHumidity}%` : '--')
+                  .fontSize(18)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.soilHumidity > 0 ? '#66BB6A' : '#CCCCCC')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Center)
+
+              Column() {
+                Text('最低湿度')
+                  .fontSize(12)
+                  .fontColor('#666666')
+                  .margin({ bottom: 4 })
+                Text(this.todayMinHumidity > 0 ? `${this.todayMinHumidity}%` : '--')
+                  .fontSize(18)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor(this.todayMinHumidity > 0 ? '#81C784' : '#CCCCCC')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Center)
+            }
+            .width('100%')
+            .padding(12)
+            .backgroundColor('#E8F5E9')
+            .borderRadius(8)
+          }
+          .width('100%')
+          .padding(16)
+          .backgroundColor('#FFFFFF')
+          .borderRadius(12)
+          .margin({
+            left: 12,
+            right: 12,
+            top: 0,
+            bottom: 8
+          })
+
+          // 设备运行状态
+          Column() {
+            Text('设备运行状态')
+              .fontSize(16)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#1F2329')
+              .margin({ bottom: 12 })
+
+            Row() {
+              // 总设备数
+              Column() {
+                Image($rawfile('总设备.png'))
+                  .width(28)
+                  .height(28)
+                  .fillColor('#333333')
+                  .margin({ bottom: 6 })
+                Text(`${this.controlDevices.length}`)
+                  .fontSize(20)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor('#333333')
+                  .margin({ bottom: 2 })
+                Text('总设备')
+                  .fontSize(11)
+                  .fontColor('#666666')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Center)
+
+              // 在线设备数
+              Column() {
+                Image($rawfile('在线.png'))
+                  .width(28)
+                  .height(28)
+                  .fillColor('#4CAF50')
+                  .margin({ bottom: 6 })
+                Text(`${this.onlineDeviceCount}`)
+                  .fontSize(20)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor('#4CAF50')
+                  .margin({ bottom: 2 })
+                Text('在线')
+                  .fontSize(11)
+                  .fontColor('#666666')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Center)
+
+              // 运行设备数
+              Column() {
+                Image($rawfile('运行中.png'))
+                  .width(28)
+                  .height(28)
+                  .fillColor('#FF9800')
+                  .margin({ bottom: 6 })
+                Text(`${this.activeDeviceCount}`)
+                  .fontSize(20)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor('#FF9800')
+                  .margin({ bottom: 2 })
+                Text('运行中')
+                  .fontSize(11)
+                  .fontColor('#666666')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Center)
+
+              // 在线率
+              Column() {
+                Image($rawfile('数据分析.png'))
+                  .width(28)
+                  .height(28)
+                  .fillColor('#2196F3')
+                  .margin({ bottom: 6 })
+                Text(this.controlDevices.length > 0 ?
+                  `${Math.round((this.onlineDeviceCount / this.controlDevices.length) * 100)}%` :
+                  '0%')
+                  .fontSize(20)
+                  .fontWeight(FontWeight.Bold)
+                  .fontColor('#2196F3')
+                  .margin({ bottom: 2 })
+                Text('在线率')
+                  .fontSize(11)
+                  .fontColor('#666666')
+              }
+              .layoutWeight(1)
+              .alignItems(HorizontalAlign.Center)
+            }
+            .width('100%')
+          }
+          .width('100%')
+          .padding(16)
+          .backgroundColor('#FFFFFF')
+          .borderRadius(12)
+          .margin({
+            left: 12,
+            right: 12,
+            top: 0,
+            bottom: 8
+          })
+
+          // 系统状态提示
+          Column() {
+            Row() {
+              Text(this.getMqttStatusIcon())
+                .fontSize(16)
+                .margin({ right: 6 })
+              Text('控制系统')
+                .fontSize(14)
+                .fontColor('#666666')
+                .layoutWeight(1)
+              Text(this.mqttStatusText)
+                .fontSize(14)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(this.getMqttStatusColor())
+            }
+            .width('100%')
+            .padding(12)
+            .backgroundColor('#FFFFFF')
+            .borderRadius(8)
+          }
+          .width('100%')
+          .padding({ left: 12, right: 12, bottom: 12 })
+        }
+        .width('100%')
+      }
+      .flexGrow(1)
+      .flexShrink(1)
+      .backgroundColor('#F1F1F1')
+      .width('100%')
+      .height('100%')
+      .scrollBar(BarState.Off)
+      .edgeEffect(EdgeEffect.Spring)
+      .scrollable(ScrollDirection.Vertical)
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#F1F1F1')
+  }
+
+  // 控制页面内容（全新设计）
+  @Builder
+  ControlPageContent() {
+    Column() {
+      // 顶部连接状态卡片
+      Column() {
+        Row() {
+          // 连接状态指示器
+          Row() {
+            Text(this.getMqttStatusIcon())
+              .fontSize(20)
+              .margin({ right: 8 })
+
+            Column() {
+              Text('设备控制中心')
+                .fontSize(14)
+                .fontColor('#666666')
+              Text(this.mqttStatusText)
+                .fontSize(16)
+                .fontWeight(FontWeight.Medium)
+                .fontColor(this.getMqttStatusColor())
+                .margin({ top: 2 })
+            }
+            .alignItems(HorizontalAlign.Start)
+          }
+          .layoutWeight(1)
+        }
+        .width('100%')
+        .padding(16)
+
+        // UID显示（如果已配置）
+        if (this.bemfaUID) {
+          Row() {
+            Text('UID:')
+              .fontSize(12)
+              .fontColor('#999999')
+            Text(this.getMaskedUID())
+              .fontSize(12)
+              .fontColor('#666666')
+              .margin({ left: 4 })
+          }
+          .width('100%')
+          .padding({ left: 16, right: 16, bottom: 12 })
+        }
+      }
+      .width('92%')
+      .backgroundColor('#FFFFFF')
+      .borderRadius(12)
+      .margin({ top: 16, bottom: 16 })
+
+      // 设备统计卡片
+      Row() {
+        Column() {
+          Text('在线设备')
+            .fontSize(14)
+            .fontColor('#666666')
+            .margin({ bottom: 4 })
+          Text(`${this.onlineDeviceCount}`)
+            .fontSize(24)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#4CAF50')
+        }
+        .alignItems(HorizontalAlign.Center)
+        .layoutWeight(1)
+
+        Column() {
+          Text('运行设备')
+            .fontSize(14)
+            .fontColor('#666666')
+            .margin({ bottom: 4 })
+          Text(`${this.activeDeviceCount}`)
+            .fontSize(24)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#007DFF')
+        }
+        .alignItems(HorizontalAlign.Center)
+        .layoutWeight(1)
+
+        Column() {
+          Text('总设备')
+            .fontSize(14)
+            .fontColor('#666666')
+            .margin({ bottom: 4 })
+          Text(`${this.controlDevices.length}`)
+            .fontSize(24)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#666666')
+        }
+        .alignItems(HorizontalAlign.Center)
+        .layoutWeight(1)
+      }
+      .width('92%')
+      .backgroundColor('#FFFFFF')
+      .borderRadius(12)
+      .padding(16)
+      .margin({ bottom: 16 })
+
+      // 快速场景控制
+      Row() {
+        Button({ type: ButtonType.Normal }) {
+          Row() {
+            Image($rawfile('开启.png'))
+              .width(18)
+              .height(18)
+              .fillColor('#FFFFFF')
+              .margin({ right: 6 })
+            Text('全部开启')
+              .fontSize(15)
+              .fontColor('#FFFFFF')
+          }
+        }
+        .backgroundColor('#00B75E')
+        .borderRadius(10)
+        .layoutWeight(1)
+        .height(42)
+        .enabled(this.mqttStatus === MqttStatus.CONNECTED)
+        .onClick(() => {
+          this.toggleAllDevicesMQTT(true);
+        })
+
+        Button({ type: ButtonType.Normal }) {
+          Row() {
+            Image($rawfile('关闭.png'))
+              .width(18)
+              .height(18)
+              .fillColor('#FFFFFF')
+              .margin({ right: 6 })
+            Text('全部关闭')
+              .fontSize(15)
+              .fontColor('#FFFFFF')
+          }
+        }
+        .backgroundColor('#E34607')
+        .borderRadius(10)
+        .layoutWeight(1)
+        .height(42)
+        .margin({ left: 10 })
+        .enabled(this.mqttStatus === MqttStatus.CONNECTED)
+        .onClick(() => {
+          this.toggleAllDevicesMQTT(false);
+        })
+      }
+      .width('92%')
+      .margin({ bottom: 10 })
+
+      // 刷新按钮（单独一行）
+      Button({ type: ButtonType.Normal }) {
+        Row() {
+          Image($rawfile('刷新.png'))
+            .width(16)
+            .height(16)
+            .fillColor('#6531FF')
+            .margin({ right: 6 })
+          Text('刷新设备状态')
+            .fontSize(13)
+            .fontColor('#6531FF')
+        }
+      }
+      .backgroundColor('#F5F2FF')
+      .borderRadius(10)
+      .width('92%')
+      .height(38)
+      .margin({ bottom: 12 })
+      .onClick(() => {
+        this.refreshDeviceOnlineStatus();
+      })
+
+      // 设备控制列表
+      if (this.controlDevices.length > 0) {
+        List() {
+          ForEach(this.controlDevices, (device: ControlDevice) => {
+            ListItem() {
+              this.ControlDeviceCard(device)
+            }
+            .margin({ bottom: 12 })
+          })
+        }
+        .width('92%')
+        .height('100%')
+        .layoutWeight(1)
+      } else {
+        // 空状态提示
+        Column() {
+          Text('📱')
+            .fontSize(64)
+            .margin({ bottom: 16 })
+
+          Text('暂无设备')
+            .fontSize(18)
+            .fontColor('#666666')
+            .margin({ bottom: 8 })
+
+          Text('系统正在从巴法云同步设备...')
+            .fontSize(14)
+            .fontColor('#999999')
+            .margin({ bottom: 24 })
+
+          Button('手动同步')
+            .fontSize(16)
+            .fontColor('#FFFFFF')
+            .backgroundColor('#007DFF')
+            .borderRadius(8)
+            .height(44)
+            .padding({ left: 32, right: 32 })
+            .onClick(() => {
+              this.syncDevicesFromBemfa();
+            })
+        }
+        .width('92%')
+        .height('100%')
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .padding(0)
+    .margin(0)
+    .justifyContent(FlexAlign.Start)
+    .backgroundColor('#F1F1F1')
+  }
+
+  // 控制设备卡片（全新设计）
+  @Builder
+  ControlDeviceCard(device: ControlDevice) {
+    Column() {
+      Row() {
+        // 设备图标和信息
+        Row() {
+          Image(device.isActive ? $rawfile('开启.png') : $rawfile('关闭.png'))
+            .width(32)
+            .height(32)
+            .fillColor(device.isActive ? '#00B75E' : '#8A8F99')
+            .margin({ right: 12 })
+
+          Column() {
+            // 设备名称（带编辑按钮）
+            Row() {
+              Text(device.name)
+                .fontSize(18)
+                .fontWeight(FontWeight.Bold)
+                .fontColor('#333333')
+
+              // 编辑昵称按钮
+              Text('✏️')
+                .fontSize(14)
+                .margin({ left: 8 })
+                .onClick(() => {
+                  this.editingDevice = device;
+                  this.newDeviceName = device.name;
+                  this.showEditNameDialog = true;
+                })
+            }
+            .margin({ bottom: 4 })
+
+            // 设备区域
+            Text(device.area)
+              .fontSize(14)
+              .fontColor('#666666')
+              .margin({ bottom: 4 })
+
+            // 主题名称
+            Text(`主题: ${device.topic}`)
+              .fontSize(12)
+              .fontColor('#999999')
+          }
+          .alignItems(HorizontalAlign.Start)
+        }
+        .layoutWeight(1)
+
+        // 开关控制
+        Toggle({ type: ToggleType.Switch, isOn: device.isActive })
+          .selectedColor('#00B75E')
+          .switchPointColor('#FFFFFF')
+          .enabled(this.mqttStatus === MqttStatus.CONNECTED && device.isOnline)
+          .onChange((isOn: boolean) => {
+            this.toggleDeviceMQTT(device.id, isOn);
+          })
+      }
+      .width('100%')
+      .margin({ bottom: 12 })
+
+      // 设备状态信息
+      Row() {
+        // 运行状态
+        Row() {
+          Text('状态:')
+            .fontSize(13)
+            .fontColor('#8A8F99')
+
+          Text(device.isActive ? '运行中' : '已停止')
+            .fontSize(13)
+            .fontWeight(FontWeight.Medium)
+            .fontColor(device.isActive ? '#00B75E' : '#8A8F99')
+            .margin({ left: 4 })
+        }
+
+        Blank()
+
+        // 在线状态标签
+        Row() {
+          Text(device.isOnline ? '●' : '●')
+            .fontSize(11)
+            .fontColor(device.isOnline ? '#00B75E' : '#CCCCCC')
+          Text(device.isOnline ? '在线' : '离线')
+            .fontSize(12)
+            .fontColor(device.isOnline ? '#00B75E' : '#8A8F99')
+            .margin({ left: 3 })
+        }
+        .padding({
+          left: 10,
+          right: 10,
+          top: 4,
+          bottom: 4
+        })
+        .backgroundColor(device.isOnline ? '#F0FDF5' : '#F1F1F1')
+        .borderRadius(12)
+      }
+      .width('100%')
+    }
+    .width('100%')
+    .padding(14)
+    .backgroundColor('#FFFFFF')
+    .borderRadius(12)
+    .shadow({ radius: 2, color: '#08000000', offsetY: 1 })
+  }
+
+  // 通过MQTT切换单个设备
+  toggleDeviceMQTT(deviceId: number, isActive: boolean) {
+    const device = this.controlDevices.find(d => d.id === deviceId);
+    if (!device) {
+      return;
+    }
+
+    const command = isActive ? 'on' : 'off';
+    const topic = `${device.topic}/set`; // 使用/set后缀发送控制命令
+
+    console.info(`[控制] 发送命令到 ${topic}: ${command}`);
+
+    mqttService.publish(topic, command, 1, false).then((success) => {
+      if (success) {
+        console.info(`[控制] 命令发送成功`);
+        // 更新本地状态（实际状态应该由设备反馈确认）
+        const deviceIndex = this.controlDevices.findIndex(d => d.id === deviceId);
+        if (deviceIndex !== -1) {
+          this.controlDevices[deviceIndex].isActive = isActive;
+          this.updateDeviceStatistics();
+        }
+      } else {
+        console.error(`[控制] 命令发送失败`);
+      }
+    });
+  }
+
+  // 通过MQTT切换所有设备
+  toggleAllDevicesMQTT(isActive: boolean) {
+    const command = isActive ? 'on' : 'off';
+
+    this.controlDevices.forEach(device => {
+      const topic = `${device.topic}/set`;
+      mqttService.publish(topic, command, 1, false);
+
+      // 更新本地状态
+      const deviceIndex = this.controlDevices.findIndex(d => d.id === device.id);
+      if (deviceIndex !== -1) {
+        this.controlDevices[deviceIndex].isActive = isActive;
+      }
+    });
+
+    this.updateDeviceStatistics();
+  }
+
+  // 更新设备统计
+  updateDeviceStatistics() {
+    this.activeDeviceCount = this.controlDevices.filter(d => d.isActive).length;
+    this.onlineDeviceCount = this.controlDevices.filter(d => d.isOnline).length;
+  }
+
+  // 确认修改设备昵称
+  async confirmEditDeviceName() {
+    if (!this.editingDevice) {
+      console.error('[控制] 没有选中要编辑的设备');
+      return;
+    }
+
+    if (!this.newDeviceName || this.newDeviceName.trim().length === 0) {
+      console.error('[控制] 昵称不能为空');
+      return;
+    }
+
+    const device = this.editingDevice;
+    const newName = this.newDeviceName.trim();
+
+    // 如果昵称没有改变，直接关闭对话框
+    if (newName === device.name) {
+      this.showEditNameDialog = false;
+      return;
+    }
+
+    console.info(`[控制] 修改设备昵称: ${device.topic} (${device.name} → ${newName})`);
+
+    try {
+      // 调用API修改昵称
+      const result = await bemfaCloudService.modifyTopicName(
+        device.topic,
+        newName,
+        BemfaConfig.PROTOCOL_TYPE_MQTT_V1
+      );
+
+      if (result.code === 0) {
+        console.info('[控制] ✅ 修改昵称成功');
+
+        // 更新本地设备列表
+        const deviceIndex = this.controlDevices.findIndex(d => d.id === device.id);
+        if (deviceIndex !== -1) {
+          this.controlDevices[deviceIndex].name = newName;
+        }
+
+        // 关闭对话框
+        this.showEditNameDialog = false;
+
+        // 提示成功（可选：使用Toast组件）
+        console.info(`[控制] 设备 ${device.topic} 昵称已更新为: ${newName}`);
+      } else {
+        console.error('[控制] ❌ 修改昵称失败:', result.message);
+        // 这里可以添加错误提示UI
+      }
+    } catch (error) {
+      console.error('[控制] 修改昵称异常:', JSON.stringify(error));
+    }
+  }
+
+  // 获取MQTT状态图标
+  getMqttStatusIcon(): string {
+    switch (this.mqttStatus) {
+      case MqttStatus.CONNECTED:
+        return '🟢';
+      case MqttStatus.CONNECTING:
+      case MqttStatus.RECONNECTING:
+        return '🟡';
+      case MqttStatus.ERROR:
+        return '🔴';
+      default:
+        return '⚪';
+    }
+  }
+
+  // 获取MQTT状态颜色
+  getMqttStatusColor(): string {
+    switch (this.mqttStatus) {
+      case MqttStatus.CONNECTED:
+        return '#4CAF50';
+      case MqttStatus.CONNECTING:
+      case MqttStatus.RECONNECTING:
+        return '#FF9800';
+      case MqttStatus.ERROR:
+        return '#F44336';
+      default:
+        return '#999999';
+    }
+  }
+
+  // 获取传感器设备数量
+  getSensorDeviceCount(): number {
+    // 支持两种识别方式：主题名后缀004 或 设备类型为传感器
+    return this.controlDevices.filter((device: ControlDevice) =>
+    device.topic.endsWith('004') || device.deviceType === '传感器'
+    ).length;
+  }
+
+  // 根据温度获取天气描述
+  getWeatherDesc(): string {
+    if (this.temperature === 0) {
+      return '等待数据';
+    } else if (this.temperature < 10) {
+      return '寒冷';
+    } else if (this.temperature < 20) {
+      return '凉爽';
+    } else if (this.temperature < 28) {
+      return '舒适';
+    } else if (this.temperature < 35) {
+      return '温暖';
+    } else {
+      return '炎热';
+    }
+  }
+
+  // 获取脱敏的UID
+  getMaskedUID(): string {
+    if (!this.bemfaUID || this.bemfaUID.length < 8) {
+      return '未配置';
+    }
+    return this.bemfaUID.substring(0, 4) + '***' + this.bemfaUID.substring(this.bemfaUID.length - 4);
+  }
+
+  // 初始化MQTT连接
+  async initMQTT() {
+    if (!this.bemfaUID) {
+      console.warn('[MQTT] UID未配置');
+      return;
+    }
+
+    // 设置客户端ID
+    mqttService.setClientId(this.bemfaUID);
+
+    // 设置状态回调
+    mqttService.onStatusChange((status: MqttStatus) => {
+      this.mqttStatus = status;
+
+      switch (status) {
+        case MqttStatus.DISCONNECTED:
+          this.mqttStatusText = '未连接';
+          break;
+        case MqttStatus.CONNECTING:
+          this.mqttStatusText = '连接中...';
+          break;
+        case MqttStatus.CONNECTED:
+          this.mqttStatusText = '已连接';
+          // 连接成功后订阅所有设备主题
+          this.subscribeAllDevices();
+          break;
+        case MqttStatus.RECONNECTING:
+          this.mqttStatusText = '重连中...';
+          break;
+        case MqttStatus.ERROR:
+          this.mqttStatusText = '连接失败';
+          break;
+      }
+    });
+
+    // 设置消息回调
+    mqttService.onMessage((message: MqttMessage) => {
+      console.info('[MQTT] 收到消息:', message.topic, message.payload);
+      this.handleMQTTMessage(message);
+    });
+
+    // 连接MQTT服务器
+    await mqttService.connect();
+  }
+
+  // 订阅所有设备主题
+  subscribeAllDevices() {
+    this.controlDevices.forEach(device => {
+      mqttService.subscribe(device.topic);
+      console.info('[MQTT] 订阅主题:', device.topic);
+    });
+
+    // 订阅完成后，查询所有设备的在线状态
+    this.refreshDeviceOnlineStatus();
+  }
+
+  // 刷新所有设备的在线状态（优化版：使用getAllTopics一次获取所有状态）
+  async refreshDeviceOnlineStatus() {
+    console.info('[控制] 开始查询设备在线状态');
+
+    try {
+      // 方式1：使用getAllTopics API（推荐，更高效，一次请求获取所有状态）
+      const result = await bemfaCloudService.getAllTopics(1);
+
+      if (result.code === 0 && result.data?.data && result.data.data.length > 0) {
+        // 创建在线状态映射表
+        const onlineMap = new Map<string, boolean>();
+        result.data.data.forEach(topic => {
+          onlineMap.set(topic.topic, topic.online);
+        });
+
+        // 更新设备在线状态
+        let onlineCount = 0;
+        this.controlDevices.forEach((device, index) => {
+          const isOnline = onlineMap.get(device.topic) || false;
+          this.controlDevices[index].isOnline = isOnline;
+          if (isOnline) {
+            onlineCount++;
+          }
+          console.info(`[控制] 设备 ${device.name} (${device.topic}): ${isOnline ? '🟢在线' : '⚪离线'}`);
+        });
+
+        console.info(`[控制] ✅ 在线状态更新完成，在线设备: ${onlineCount}/${this.controlDevices.length}`);
+      }
+
+      this.updateDeviceStatistics();
+    } catch (error) {
+      console.error('[控制] ❌ 刷新在线状态失败:', error);
+    }
+  }
+
+  // 单独查询某个设备的在线状态（备用方法，用于精确查询单个设备）
+  async checkSingleDeviceOnline(topic: string) {
+    console.info('[控制] 精确查询设备在线状态:', topic);
+
+    const result = await bemfaCloudService.checkDeviceOnline(topic, 1);
+
+    if (result.code === 0) {
+      console.info(`[控制] 设备 ${topic}: ${result.data ? '🟢在线' : '⚪离线'}`);
+      return result.data;
+    } else {
+      console.warn(`[控制] 查询失败: ${result.message}`);
+      return false;
+    }
+  }
+
+  // 刷新传感器数据（从巴法云API获取最新消息，仅MQTT协议）
+  async refreshSensorData() {
+    console.info('[首页] 开始刷新传感器数据（MQTT协议）');
+
+    try {
+      // 查询MQTT协议的传感器设备
+      const result = await bemfaCloudService.getAllTopics(1);
+
+      // 注意：API返回的是 data.data 的嵌套结构
+      if (result.code === 0 && result.data?.data && result.data.data.length > 0) {
+        // 过滤出传感器设备（后缀004 或 设备类型为sensor）
+        const sensorDevices = result.data.data.filter((topic: TopicDetail) =>
+        topic.topic.endsWith('004') || topic.deviceType === 'sensor'
+        );
+
+        if (sensorDevices.length > 0) {
+          // 使用第一个传感器设备的数据
+          const sensor = sensorDevices[0];
+          if (sensor.msg) {
+            console.info(`[首页] 传感器数据更新: ${sensor.name} -> ${sensor.msg}`);
+            this.parseSensorData(sensor.msg);
+          } else {
+            console.info('[首页] 传感器设备未发送数据');
+          }
+        } else {
+          console.info('[首页] 未找到传感器设备（后缀004）');
+        }
+      } else {
+        console.info('[首页] 获取设备列表失败或为空');
+      }
+    } catch (error) {
+      console.error('[首页] 刷新传感器数据失败:', error);
+    }
+  }
+
+  // 从巴法云同步设备列表（仅MQTT协议）
+  async syncDevicesFromBemfa() {
+    console.info('[控制] 开始从巴法云同步设备列表（MQTT协议）');
+    console.info('[控制] 当前UID:', this.bemfaUID.substring(0, 8) + '...');
+
+    // 获取MQTT协议设备（type=1）
+    const result = await bemfaCloudService.getAllTopics(1);
+
+    console.info('[控制] API返回状态码:', result.code);
+    console.info('[控制] API返回消息:', result.msg);
+    console.info('[控制] API返回数据数量:', result.data?.data?.length || 0);
+
+    // 注意：API返回的是 data.data 的嵌套结构
+    if (result.code === 0 && result.data?.data && result.data.data.length > 0) {
+      const devices = result.data.data;
+      console.info(`[控制] ✅ 找到 ${devices.length} 个MQTT设备`);
+
+      // 打印所有设备信息
+      devices.forEach((topic, idx) => {
+        console.info(`[控制] 设备${idx + 1}: ${topic.topic} | 名称: ${topic.name} | 在线: ${topic.online}`);
+      });
+
+      // 转换设备列表
+      const newDevices: ControlDevice[] = devices.map((topic: TopicDetail, index: number): ControlDevice => {
+        const device: ControlDevice = {
+          id: index + 1,
+          name: topic.name || topic.topic,
+          topic: topic.topic,
+          isActive: topic.msg === 'on' || topic.msg === '1',
+          isOnline: topic.online,
+          area: topic.room || '未分组',
+          deviceType: this.getDeviceTypeName(topic.deviceType)
+        };
+
+        // 如果是传感器设备（后缀004 或 设备类型为sensor），立即解析最后的消息更新首页数据
+        if ((topic.topic.endsWith('004') || topic.deviceType === 'sensor') && topic.msg) {
+          console.info(`[控制] 发现传感器设备: ${topic.name}, 最后消息: ${topic.msg}`);
+          this.parseSensorData(topic.msg);
+        }
+
+        return device;
+      });
+
+      this.controlDevices = newDevices;
+      this.updateDeviceStatistics();
+
+      console.info(`[控制] ✅ 同步成功，共 ${newDevices.length} 个MQTT设备`);
+
+      // 同步后重新订阅所有主题
+      if (this.mqttStatus === MqttStatus.CONNECTED) {
+        this.subscribeAllDevices();
+      }
+    } else {
+      console.warn('[控制] ⚠️ 没有找到MQTT协议设备');
+      console.warn('[控制] 返回码:', result.code);
+      console.warn('[控制] 错误信息:', result.msg);
+      console.warn('[控制] 数据为空:', result.data?.data ? '否' : '是');
+      this.controlDevices = [];
+    }
+  }
+
+  // 获取设备类型中文名称
+  getDeviceTypeName(deviceType?: string): string {
+    const typeMap: Record<string, string> = {
+      'outlet': '插座',
+      'light': '灯泡',
+      'fan': '风扇',
+      'sensor': '传感器',
+      'aircondition': '空调',
+      'switch': '开关',
+      'curtain': '窗帘',
+      'thermostat': '温控器',
+      'waterheater': '热水器',
+      'television': '电视',
+      'airpurifier': '空气净化器'
+    };
+
+    return typeMap[deviceType || ''] || '开关';
+  }
+
+  // 获取设备历史消息
+  async loadDeviceHistory(topic: string, num: number = 20) {
+    this.isLoadingHistory = true;
+    this.selectedDeviceForHistory = topic;
+    console.info(`[分析] 加载设备 ${topic} 的历史消息，数量: ${num}`);
+
+    const result = await bemfaCloudService.getMessages(topic, 1, num);
+
+    if (result.code === 0 && result.data && result.data.length > 0) {
+      this.historyMessages = result.data;
+      console.info(`[分析] ✅ 成功加载 ${result.data.length} 条历史消息`);
+    } else {
+      this.historyMessages = [];
+      console.warn('[分析] ⚠️ 未获取到历史消息');
+      console.warn('[分析] 返回码:', result.code);
+      console.warn('[分析] 错误信息:', result.message);
+    }
+
+    this.isLoadingHistory = false;
+  }
+
+  // 处理MQTT消息
+  handleMQTTMessage(message: MqttMessage) {
+    // 查找对应的设备
+    const device = this.controlDevices.find(d => d.topic === message.topic);
+    if (!device) {
+      return;
+    }
+
+    const deviceIndex = this.controlDevices.findIndex(d => d.topic === message.topic);
+    if (deviceIndex === -1) {
+      return;
+    }
+
+    // 解析消息内容
+    const payload = message.payload.toLowerCase();
+
+    // 如果是传感器设备（后缀004 或 设备类型为传感器），解析传感器数据
+    if (message.topic.endsWith('004') || device.deviceType === '传感器') {
+      this.parseSensorData(message.payload);
+    }
+
+    // 更新设备状态
+    if (payload === 'on' || payload === '1') {
+      this.controlDevices[deviceIndex].isActive = true;
+    } else if (payload === 'off' || payload === '0') {
+      this.controlDevices[deviceIndex].isActive = false;
+    }
+
+    // 标记设备为在线（收到消息说明设备在线）
+    this.controlDevices[deviceIndex].isOnline = true;
+
+    this.updateDeviceStatistics();
+  }
+
+  // 解析传感器数据（格式：temp:25,humi:68,light:850）
+  parseSensorData(payload: string) {
+    let temperature: number | undefined = undefined;
+    let humidity: number | undefined = undefined;
+    let lightIntensity: number | undefined = undefined;
+
+    try {
+      // 尝试解析JSON格式
+      const data: Record<string, number> = JSON.parse(payload) as Record<string, number>;
+      if (data.temperature !== undefined) {
+        this.temperature = Math.round(data.temperature);
+        temperature = data.temperature;
+      }
+      if (data.humidity !== undefined) {
+        this.soilHumidity = Math.round(data.humidity);
+        humidity = data.humidity;
+      }
+      if (data.light !== undefined) {
+        this.lightIntensity = Math.round(data.light);
+        lightIntensity = data.light;
+      }
+      console.info('[传感器] JSON格式数据更新:', JSON.stringify(data));
+    } catch (e) {
+      // 尝试解析键值对格式 (temp:25,humi:68,light:850)
+      const pairs = payload.split(',');
+      pairs.forEach(pair => {
+        const parts = pair.split(':');
+        if (parts.length === 2) {
+          const key = parts[0];
+          const value = parts[1];
+          const numValue = parseFloat(value);
+          if (!isNaN(numValue)) {
+            if (key === 'temp' || key === 'temperature') {
+              this.temperature = Math.round(numValue);
+              temperature = numValue;
+              console.info('[传感器] 温度更新:', this.temperature);
+            } else if (key === 'humi' || key === 'humidity' || key === 'soil') {
+              this.soilHumidity = Math.round(numValue);
+              humidity = numValue;
+              console.info('[传感器] 湿度更新:', this.soilHumidity);
+            } else if (key === 'light' || key === 'lux') {
+              this.lightIntensity = Math.round(numValue);
+              lightIntensity = numValue;
+              console.info('[传感器] 光照更新:', this.lightIntensity);
+            }
+          }
+        }
+      });
+    }
+
+    // 数据更新后，自动记录到分析页面
+    this.updateAnalysisData();
+
+    // 🔥 自动上传传感器数据到服务器
+    this.uploadSensorDataToServer(temperature, humidity, lightIntensity);
+  }
+
+  /**
+   * 上传传感器数据到服务器
+   */
+  private async uploadSensorDataToServer(
+    temperature?: number,
+    humidity?: number,
+    lightIntensity?: number
+  ): Promise<void> {
+    // 检查是否有有效数据
+    if (temperature === undefined && humidity === undefined && lightIntensity === undefined) {
+      console.warn('[传感器上传] 没有有效数据，跳过上传');
+      return;
+    }
+
+    try {
+      // 构建上传数据
+      const uploadData: SensorDataUploadRequest = {
+        device_topic: 'farm001', // 默认设备主题，可以根据实际情况动态获取
+        temperature: temperature,
+        humidity: humidity,
+        light_intensity: lightIntensity
+      };
+
+      // 如果用户已登录，添加用户ID
+      if (this.userProfile.id > 0) {
+        uploadData.user_id = this.userProfile.id;
+      }
+
+      console.info('[传感器上传] 准备上传数据:', JSON.stringify(uploadData));
+
+      // 调用API上传
+      const response = await apiService.uploadSensorData(uploadData);
+
+      if (response.success) {
+        console.info('[传感器上传] ✅ 上传成功:', response.message);
+      } else {
+        console.error('[传感器上传] ❌ 上传失败:', response.message);
+      }
+    } catch (error) {
+      console.error('[传感器上传] ❌ 上传异常:', error);
+    }
+  }
+
+  // 底部标签构建器 - 现代渐变配色
+  @Builder
+  TabBuilder(title: string, index: number) {
+    Column() {
+      // 图标 - 激活状态
+      if (this.currentIndex === index) {
+        Image(index === 0 ? $rawfile('首页.png') :
+          index === 1 ? $rawfile('控制.png') :
+            index === 2 ? $rawfile('分析.png') :
+              $rawfile('我的.png'))
+          .width(28)
+          .height(28)
+          .fillColor('#4facfe')
+          .transition({ type: TransitionType.All, scale: { x: 0.9, y: 0.9 }, opacity: 0 })
+          .animation({
+            duration: 200,
+            curve: Curve.EaseOut
+          })
+      } else {
+        // 未激活状态
+        Image(index === 0 ? $rawfile('首页.png') :
+          index === 1 ? $rawfile('控制.png') :
+            index === 2 ? $rawfile('分析.png') :
+              $rawfile('我的.png'))
+          .width(24)
+          .height(24)
+          .fillColor('#999999')
+          .opacity(0.6)
+      }
+
+      // 标题文字
+      Text(title)
+        .fontSize(this.currentIndex === index ? 12 : 11)
+        .fontColor(this.currentIndex === index ? '#4facfe' : '#999999')
+        .fontWeight(this.currentIndex === index ? FontWeight.Bold : FontWeight.Normal)
+        .margin({ top: 4 })
+        .transition({ type: TransitionType.All, opacity: 0.5 })
+        .animation({
+          duration: 200,
+          curve: Curve.EaseOut
+        })
+    }
+    .width('100%')
+    .padding({ top: 8, bottom: 8 })
+    .justifyContent(FlexAlign.Center)
+  }
+
+  // 分析页面内容
+  // 🔥 分析页面内容 - 天气展示 + AI智能分析
+  @Builder
+  AnalysisPageContent() {
+    Column() {
+      // ========== 上半部分：天气展示 ==========
+      this.WeatherSection()
+
+      // ========== 下半部分：AI智能分析聊天 ==========
+      this.AIChatSection()
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor('#FAFAFA')
+  }
+
+  // 天气展示区域
+  @Builder
+  WeatherSection() {
+    Column() {
+      // 天气卡片
+      Column() {
+        Row() {
+          Column() {
+            // 主要天气信息
+            Text(this.getWeatherDescription())
+              .fontSize(20)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#2c5fb3')
+              .margin({ bottom: 4 })
+
+            Text(`${this.temperature > 0 ? this.temperature : '--'}°C`)
+              .fontSize(48)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#1a4596')
+              .margin({ bottom: 8 })
+
+            Text(`湿度 ${this.soilHumidity > 0 ? this.soilHumidity : '--'}% | 光照 ${this.lightIntensity > 0 ?
+              this.lightIntensity : '--'}Lx`)
+              .fontSize(14)
+              .fontColor('#666666')
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+
+          // 天气图标
+          if (this.temperature === 0 && this.soilHumidity === 0) {
+            // 等待数据时显示倒计时图片
+            Image($rawfile('倒计时.png'))
+              .width(64)
+              .height(64)
+          } else {
+            // 其他情况显示天气emoji
+            Text(this.getWeatherIcon())
+              .fontSize(64)
+          }
+        }
+        .width('100%')
+        .alignItems(VerticalAlign.Center)
+
+        // 三日数据卡片
+        Row() {
+          // 温度卡片
+          Column() {
+            Image($rawfile('环境温度.png'))
+              .width(28)
+              .height(28)
+              .margin({ bottom: 8 })
+            Text(`${this.temperature > 0 ? this.temperature : '--'}°C`)
+              .fontSize(18)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#2c5fb3')
+            Text('温度')
+              .fontSize(12)
+              .fontColor('#6b8dc9')
+              .margin({ top: 4 })
+          }
+          .layoutWeight(1)
+          .padding(16)
+          .backgroundColor('rgba(255, 255, 255, 0.85)')
+          .borderRadius(20)
+          .margin({ right: 6 })
+          .shadow({
+            radius: 6,
+            color: 'rgba(79, 143, 248, 0.08)',
+            offsetX: 0,
+            offsetY: 2
+          })
+
+          // 湿度卡片
+          Column() {
+            Image($rawfile('土壤湿度.png'))
+              .width(28)
+              .height(28)
+              .margin({ bottom: 8 })
+            Text(`${this.soilHumidity > 0 ? this.soilHumidity : '--'}%`)
+              .fontSize(18)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#2c5fb3')
+            Text('湿度')
+              .fontSize(12)
+              .fontColor('#6b8dc9')
+              .margin({ top: 4 })
+          }
+          .layoutWeight(1)
+          .padding(16)
+          .backgroundColor('rgba(255, 255, 255, 0.85)')
+          .borderRadius(20)
+          .margin({ left: 3, right: 3 })
+          .shadow({
+            radius: 6,
+            color: 'rgba(79, 143, 248, 0.08)',
+            offsetX: 0,
+            offsetY: 2
+          })
+
+          // 光照卡片
+          Column() {
+            Image($rawfile('光照强度-copy.png'))
+              .width(28)
+              .height(28)
+              .margin({ bottom: 8 })
+            Text(`${this.lightIntensity > 0 ? this.lightIntensity : '--'}`)
+              .fontSize(18)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#2c5fb3')
+            Text('光照(Lx)')
+              .fontSize(12)
+              .fontColor('#6b8dc9')
+              .margin({ top: 4 })
+          }
+          .layoutWeight(1)
+          .padding(16)
+          .backgroundColor('rgba(255, 255, 255, 0.85)')
+          .borderRadius(20)
+          .margin({ left: 6 })
+          .shadow({
+            radius: 6,
+            color: 'rgba(79, 143, 248, 0.08)',
+            offsetX: 0,
+            offsetY: 2
+          })
+        }
+        .width('100%')
+        .margin({ top: 16 })
+      }
+      .width('100%')
+      .padding(20)
+      .linearGradient({
+        angle: 135,
+        colors: [['#EBF4FF', 0.0], ['#F5F9FF', 0.5], ['#FFFFFF', 1.0]]
+      })
+      .borderRadius(24)
+      .shadow({
+        radius: 12,
+        color: 'rgba(79, 143, 248, 0.12)',
+        offsetX: 0,
+        offsetY: 4
+      })
+      .margin(16)
+    }
+    .width('100%')
+  }
+
+  // AI聊天区域
+  @Builder
+  AIChatSection() {
+    Column() {
+      // 标题栏
+      Row() {
+        Row() {
+          Image($rawfile('B站狗头.png'))
+            .width(24)
+            .height(24)
+            .margin({ right: 8 })
+          
+          Text('AI智能分析')
+            .fontSize(18)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#333333')
+        }
+
+        Blank()
+
+        Button('清空')
+          .fontSize(13)
+          .fontColor('#FF5722')
+          .backgroundColor('#FFEBEE')
+          .borderRadius(16)
+          .height(28)
+          .padding({ left: 12, right: 12 })
+          .onClick(() => {
+            this.aiMessages = [];
+            this.addWelcomeMessage();
+          })
+      }
+      .width('100%')
+      .padding({
+        left: 16,
+        right: 16,
+        top: 16,
+        bottom: 12
+      })
+
+      // 聊天消息列表
+      Scroll(this.aiChatScroller) {
+        Column() {
+          ForEach(this.aiMessages, (msg: AIMessage, index: number) => {
+            this.AIMessageItem(msg, index)
+          })
+
+          // 加载动画
+          if (this.isAILoading) {
+            Row() {
+              LoadingProgress()
+                .width(30)
+                .height(30)
+                .color('#667eea')
+              Text('AI分析中...')
+                .fontSize(14)
+                .fontColor('#999999')
+                .margin({ left: 8 })
+            }
+            .margin({ top: 12, bottom: 12 })
+          }
+        }
+        .width('100%')
+        .justifyContent(FlexAlign.Start)
+        .padding({
+          left: 16,
+          right: 16,
+          top: 8,
+          bottom: 8
+        })
+      }
+      .layoutWeight(1)
+      .backgroundColor('#F5F5F5')
+      .scrollBar(BarState.Off)
+
+      // 快速问题按钮
+      if (this.aiMessages.length <= 1 && !this.isAILoading) {
+        Scroll() {
+          Row() {
+            ForEach(this.aiQuickQuestions, (question: string) => {
+              Text(question)
+                .fontSize(13)
+                .fontColor('#667eea')
+                .padding({
+                  left: 12,
+                  right: 12,
+                  top: 8,
+                  bottom: 8
+                })
+                .backgroundColor('#EEF2FF')
+                .borderRadius(16)
+                .margin({ right: 8 })
+                .onClick(() => {
+                  this.sendAIMessage(question);
+                })
+            })
+          }
+          .padding({
+            left: 16,
+            right: 16,
+            top: 8,
+            bottom: 8
+          })
+        }
+        .scrollable(ScrollDirection.Horizontal)
+        .scrollBar(BarState.Off)
+        .width('100%')
+        .backgroundColor('#FFFFFF')
+      }
+
+      // 底部输入框
+      Row() {
+        TextInput({ placeholder: '询问AI关于农场数据...', text: this.aiInputText })
+          .layoutWeight(1)
+          .height(44)
+          .fontSize(15)
+          .borderRadius(22)
+          .backgroundColor('#F5F5F5')
+          .padding({ left: 16, right: 16 })
+          .enabled(!this.isAILoading)
+          .onChange((value: string) => {
+            this.aiInputText = value;
+          })
+
+        Button() {
+          Image($rawfile('发送.png'))
+            .width(24)
+            .height(24)
+            .fillColor(Color.White)
+        }
+        .width(44)
+        .height(44)
+        .backgroundColor(this.aiInputText.trim().length > 0 ? '#667eea' : '#CCCCCC')
+        .borderRadius(22)
+        .margin({ left: 8 })
+        .enabled(!this.isAILoading && this.aiInputText.trim().length > 0)
+        .onClick(() => {
+          if (this.aiInputText.trim().length > 0) {
+            this.sendAIMessage(this.aiInputText);
+            this.aiInputText = '';
+          }
+        })
+      }
+      .width('100%')
+      .padding(16)
+    }
+    .layoutWeight(1)
+    .backgroundColor('#FFFFFF')
+    .borderRadius(24)
+    .margin({ left: 16, right: 16, bottom: 16, top: 8 })
+    .shadow({
+      radius: 8,
+      color: 'rgba(0, 0, 0, 0.06)',
+      offsetX: 0,
+      offsetY: 2
+    })
+  }
+
+  // 数据卡片组件（复用性强，易于理解）
+  @Builder
+  DataCard(icon: string, label: string, value: string, color: string) {
+    Column() {
+      Text(icon)
+        .fontSize(36)
+        .margin({ bottom: 8 })
+
+      Text(label)
+        .fontSize(12)
+        .fontColor('#666666')
+        .margin({ bottom: 4 })
+
+      Text(value)
+        .fontSize(20)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(color)
+    }
+    .width('100%')
+    .padding(16)
+    .backgroundColor('#FFFFFF')
+    .borderRadius(12)
+    .alignItems(HorizontalAlign.Center)
+    .justifyContent(FlexAlign.Center)
+  }
+
+  // 带图片的数据卡片组件
+  @Builder
+  DataCardWithImage(imageSrc: Resource, label: string, value: string, color: string) {
+    Column() {
+      Image(imageSrc)
+        .width(36)
+        .height(36)
+        .fillColor(color)
+        .margin({ bottom: 8 })
+
+      Text(label)
+        .fontSize(12)
+        .fontColor('#666666')
+        .margin({ bottom: 4 })
+
+      Text(value)
+        .fontSize(20)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(color)
+    }
+    .width('100%')
+    .padding(16)
+    .backgroundColor('#FFFFFF')
+    .borderRadius(12)
+    .alignItems(HorizontalAlign.Center)
+    .justifyContent(FlexAlign.Center)
+  }
+
+  // ==============================================
+  // 分析页面数据处理方法（简单易懂）
+  // ==============================================
+
+  // 更新分析数据
+  updateAnalysisData() {
+    console.info('[分析] 更新数据');
+
+    // 获取当前时间
+    const now = new Date();
+    const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+    this.lastUpdateTime = timeStr;
+
+    // 记录当前数据到历史
+    const newData: AnalysisData = {
+      date: timeStr,
+      temperature: this.temperature,
+      humidity: this.soilHumidity,
+      soilMoisture: this.lightIntensity, // 用光照强度代替土壤湿度
+      yield: 0  // 产量暂不使用
+    };
+
+    // 添加到数组开头，保持最新的在前面
+    this.analysisData.unshift(newData);
+
+    // 只保留最近10条记录（演示用）
+    if (this.analysisData.length > 10) {
+      this.analysisData.pop(); // 删除最旧的
+    }
+
+    // 更新今日最高最低值
+    this.updateTodayStats();
+
+    console.info('[分析] 记录数据:', `温度${this.temperature}°C 湿度${this.soilHumidity}%`);
+  }
+
+  // 更新今日统计（计算最高最低值）
+  updateTodayStats() {
+    if (this.analysisData.length === 0) {
+      return;
+    }
+
+    // 计算温度的最高最低值
+    const temps = this.analysisData.map(d => d.temperature);
+    this.todayMaxTemp = Math.max(...temps);
+    this.todayMinTemp = Math.min(...temps);
+
+    // 计算湿度的最高最低值
+    const humidities = this.analysisData.map(d => d.humidity);
+    this.todayMaxHumidity = Math.max(...humidities);
+    this.todayMinHumidity = Math.min(...humidities);
+
+    console.info('[分析] 今日统计:',
+      `温度 ${this.todayMinTemp}-${this.todayMaxTemp}°C, 湿度 ${this.todayMinHumidity}-${this.todayMaxHumidity}%`);
+  }
+
+  @State menuItems: ProfileMenuItem[] = [
+    {
+      id: 'profile',
+      title: '个人资料',
+      icon: '个人资料.png',
+      hasArrow: true
+    },
+    {
+      id: 'settings',
+      title: '系统设置',
+      icon: '系统设置.png',
+      hasArrow: true
+    },
+    {
+      id: 'help',
+      title: '帮助与反馈',
+      icon: '帮助与反馈.png',
+      hasArrow: true
+    },
+    {
+      id: 'about',
+      title: '关于我们',
+      icon: '关于我们.png',
+      hasArrow: true
+    },
+    {
+      id: 'logout',
+      title: '退出登录',
+      icon: '退出登录.png',
+      hasArrow: false
+    }
+  ];
+
+  /**
+   * 根据用户模式获取对应的菜单项列表
+   *
+   * 该方法根据当前用户的登录状态和模式，动态返回不同的菜单项
+   * 实现了基于用户权限的菜单显示控制
+   *
+   * @returns ProfileMenuItem[] 返回当前用户模式下可用的菜单项数组
+   *
+   * 用户模式说明：
+   * - 'guest': 游客模式，只显示帮助和关于菜单
+   * - 'logged_in': 已登录用户，显示所有功能菜单
+   * - 其他状态: 未登录状态，不显示任何菜单
+   *
+   * 使用场景：
+   * - 在ForEach循环中动态渲染菜单列表
+   * - 根据用户权限控制功能访问
+   */
+  getMenuItemsForCurrentMode(): ProfileMenuItem[] {
+    if (this.userMode === 'guest') {
+      // 游客模式只显示帮助和关于
+      return this.menuItems.filter(item =>
+      item.id === 'help' || item.id === 'about'
+      );
+    } else if (this.userMode === 'logged_in') {
+      // 已登录用户显示所有菜单
+      return this.menuItems;
+    } else {
+      // 未登录状态不显示菜单
+      return [];
+    }
+  }
+
+  // 我的页面内容
+  @Builder
+  ProfilePageContent() {
+    Column() {
+      // 用户信息头部
+      Column() {
+        if (this.userMode === 'guest') {
+          // 游客模式显示
+          Column() {
+            Image($rawfile('B站狗头.png'))
+              .width(80)
+              .height(80)
+              .borderRadius(40)
+              .margin({ bottom: 12 })
+
+            Text('游客用户')
+              .fontSize(20)
+              .fontWeight(FontWeight.Bold)
+              .fontColor('#333333')
+              .margin({ bottom: 4 })
+
+            Text('登录后享受更多个性化服务')
+              .fontSize(14)
+              .fontColor('#666666')
+              .margin({ bottom: 16 })
+
+            // 登录按钮
+            Button('立即登录')
+              .width(120)
+              .height(36)
+              .backgroundColor('#007AFF')
+              .borderRadius(18)
+              .fontSize(14)
+              .fontColor('#FFFFFF')
+              .onClick(() => {
+                this.userMode = 'not_logged_in';
+                this.currentView = 'login';
+              })
+          }
+          .alignItems(HorizontalAlign.Center)
+          .padding({ top: 32, bottom: 24 })
+        } else {
+          // 已登录用户显示
+          Column() {
+            Image($rawfile('B站狗头.png'))
+              .width(80)
+              .height(80)
+              .borderRadius(40)
+              .margin({ bottom: 12 })
+
+            // 用户名和管理员标识
+            Row() {
+              Text(this.userProfile.username)
+                .fontSize(20)
+                .fontWeight(FontWeight.Bold)
+                .fontColor('#333333')
+
+              // ✅ 管理员标识徽章
+              if (this.userProfile.is_admin === 1) {
+                Text('👑 管理员')
+                  .fontSize(14)
+                  .fontColor('#FFFFFF')
+                  .backgroundColor('#FF6B35')
+                  .padding({
+                    left: 8,
+                    right: 8,
+                    top: 4,
+                    bottom: 4
+                  })
+                  .borderRadius(12)
+                  .margin({ left: 8 })
+              }
+            }
+            .margin({ bottom: 4 })
+
+            Text(this.userProfile.bio)
+              .fontSize(14)
+              .fontColor('#666666')
+              .margin({ bottom: 8 })
+
+            Text(this.userProfile.phone)
+              .fontSize(14)
+              .fontColor('#999999')
+          }
+          .alignItems(HorizontalAlign.Center)
+          .padding({ top: 32, bottom: 24 })
+        }
+      }
+      .width('100%')
+      .backgroundColor('#FFFFFF')
+      .borderRadius(12)
+      .margin({ top: 16, bottom: 16 })
+
+      // 快捷操作按钮（仅登录用户可见）
+      if (this.userMode === 'logged_in') {
+        Row() {
+          // 编辑资料按钮
+          Button() {
+            Column() {
+              Image($rawfile('编辑资料.png'))
+                .width(24)
+                .height(24)
+                .fillColor('#007AFF')
+                .margin({ bottom: 4 })
+              Text('编辑资料')
+                .fontSize(14)
+                .fontColor('#333333')
+            }
+          }
+          .layoutWeight(1)
+          .height(80)
+          .backgroundColor('#FFFFFF')
+          .borderRadius(12)
+          .onClick(() => {
+            console.info('[Profile] 跳转到编辑资料页面');
+            router.pushUrl({
+              url: 'pages/EditProfile',
+              params: {
+                username: this.userProfile.username,
+                email: this.userProfile.email,
+                phone: this.userProfile.phone || '',
+                bio: this.userProfile.bio,
+                avatar: this.userProfile.avatar
+              }
+            }).catch((err: Error) => {
+              console.error('[Profile] 跳转编辑资料失败:', JSON.stringify(err));
+            });
+          })
+
+          // 间距
+          Blank().width(12)
+
+          // 修改密码按钮
+          Button() {
+            Column() {
+              Image($rawfile('修改密码.png'))
+                .width(24)
+                .height(24)
+                .fillColor('#007AFF')
+                .margin({ bottom: 4 })
+              Text('修改密码')
+                .fontSize(14)
+                .fontColor('#333333')
+            }
+          }
+          .layoutWeight(1)
+          .height(80)
+          .backgroundColor('#FFFFFF')
+          .borderRadius(12)
+          .onClick(() => {
+            console.info('[Profile] 跳转到修改密码页面');
+            router.pushUrl({
+              url: 'pages/ChangePassword'
+            }).catch((err: Error) => {
+              console.error('[Profile] 跳转修改密码失败:', JSON.stringify(err));
+            });
+          })
+        }
+        .width('100%')
+        .margin({ bottom: 16 })
+      }
+
+      // 功能菜单列表
+      Column() {
+        List() {
+          ForEach(this.getMenuItemsForCurrentMode(), (item: ProfileMenuItem, index: number) => {
+            ListItem() {
+              this.MenuItemCard(item)
+            }
+            .margin({ bottom: index < this.getMenuItemsForCurrentMode().length - 1 ? 1 : 0 })
+          })
+        }
+        .width('100%')
+        .height('auto')
+        .divider({ strokeWidth: 1, color: '#F0F0F0' })
+      }
+      .width('100%')
+      .backgroundColor('#FFFFFF')
+      .borderRadius(12)
+      .margin({ bottom: 16 })
+    }
+    .width('100%')
+    .height('100%')
+    .padding(16)
+    .backgroundColor('#F5F5F5')
+  }
+
+  // 菜单项卡片
+  @Builder
+  MenuItemCard(item: ProfileMenuItem) {
+    Row() {
+      // 判断是否为图片路径
+      if (item.icon.endsWith('.png')) {
+        Image($rawfile(item.icon))
+          .width(20)
+          .height(20)
+          .fillColor('#666666')
+          .margin({ right: 12 })
+      } else {
+        Text(item.icon)
+          .fontSize(20)
+          .margin({ right: 12 })
+      }
+
+      Text(item.title)
+        .fontSize(16)
+        .fontColor('#333333')
+        .layoutWeight(1)
+
+      if (item.hasArrow) {
+        Image($rawfile('右箭头.png'))
+          .width(16)
+          .height(16)
+          .fillColor('#CCCCCC')
+      }
+    }
+    .width('100%')
+    .padding({
+      left: 16,
+      right: 16,
+      top: 16,
+      bottom: 16
+    })
+    .backgroundColor('#FFFFFF')
+    .onClick(() => {
+      this.handleMenuItemClick(item.id);
+    })
+  }
+
+  // 处理菜单项点击事件
+  handleMenuItemClick(itemId: string) {
+    // 游客模式下某些功能需要登录
+    if (this.userMode === 'guest' && (itemId === 'profile' || itemId === 'settings')) {
+      // 提示需要登录
+      console.log('游客模式，需要登录才能访问此功能');
+      this.userMode = 'not_logged_in';
+      this.currentView = 'login';
+      return;
+    }
+
+    switch (itemId) {
+      case 'profile':
+        // 跳转到个人资料页面
+        console.log('跳转到个人资料页面');
+        break;
+      case 'settings':
+        // 跳转到系统设置页面
+        console.log('跳转到系统设置页面');
+        break;
+      case 'help':
+        // 跳转到帮助与反馈页面
+        console.log('跳转到帮助与反馈页面');
+        break;
+      case 'about':
+        // 跳转到关于我们页面
+        console.log('跳转到关于我们页面');
+        break;
+      case 'logout':
+        // 执行退出登录操作
+        console.log('执行退出登录操作');
+        this.handleLogout();
+        break;
+      default:
+        console.log('未知菜单项:', itemId);
+    }
+  }
+
+  // 登录表单验证
+  private validateLoginForm(): boolean {
+    if (!this.username.trim()) {
+      this.errorMessage = '请输入用户名';
+      return false;
+    }
+    if (!this.password.trim()) {
+      this.errorMessage = '请输入密码';
+      return false;
+    }
+    if (this.password.length < 6) {
+      this.errorMessage = '密码长度不能少于6位';
+      return false;
+    }
+    this.errorMessage = '';
+    return true;
+  }
+
+  // 注册表单验证
+  private validateRegisterForm(): boolean {
+    if (!this.username.trim()) {
+      this.errorMessage = '请输入用户名';
+      return false;
+    }
+    if (!this.phone.trim()) {
+      this.errorMessage = '请输入手机号';
+      return false;
+    }
+    if (!this.email.trim()) {
+      this.errorMessage = '请输入邮箱';
+      return false;
+    }
+    if (!this.password.trim()) {
+      this.errorMessage = '请输入密码';
+      return false;
+    }
+    if (this.password.length < 6) {
+      this.errorMessage = '密码长度不能少于6位';
+      return false;
+    }
+    if (this.password !== this.confirmPassword) {
+      this.errorMessage = '两次输入的密码不一致';
+      return false;
+    }
+    this.errorMessage = '';
+    return true;
+  }
+
+  // 处理登录
+  private async handleLogin(): Promise<void> {
+    if (!this.validateLoginForm()) {
+      return;
+    }
+
+    this.isLoading = true;
+    this.errorMessage = '';
+    this.successMessage = '';
+
+    try {
+      const loginData: LoginRequest = {
+        login: this.username.trim(),
+        password: this.password
+      };
+
+      console.log('开始登录请求:', loginData.login);
+      const response = await apiService.login(loginData);
+
+      if (response.success && response.data) {
+        // 登录成功
+        this.userProfile = {
+          id: response.data.user.id,
+          username: response.data.user.username,
+          email: response.data.user.email,
+          phone: response.data.user.phone || '',
+          avatar: response.data.user.avatar || '👤',
+          bio: response.data.user.bio || '智慧农业用户',
+          user_mode: response.data.user.user_mode,
+          is_admin: response.data.user.is_admin || 0  // ✅ 保存管理员标识
+        };
+
+        this.isLoggedIn = true;
+        this.userMode = 'logged_in';
+        this.currentView = 'main';
+        this.successMessage = '登录成功！';
+        this.clearForm();
+
+        console.log('登录成功:', this.userProfile.username);
+      } else {
+        // 登录失败
+        this.errorMessage = response.message || '登录失败，请检查用户名和密码';
+        console.error('登录失败:', response.message);
+      }
+    } catch (error) {
+      console.error('登录异常:', error);
+      this.errorMessage = '网络连接失败，请检查网络设置';
+    } finally {
+      this.isLoading = false;
+    }
+  }
+
+  // 处理注册
+  private async handleRegister(): Promise<void> {
+    if (!this.validateRegisterForm()) {
+      return;
+    }
+
+    this.isLoading = true;
+    this.errorMessage = '';
+    this.successMessage = '';
+
+    try {
+      const registerData: RegisterRequest = {
+        username: this.username.trim(),
+        email: this.email.trim(),
+        phone: this.phone.trim(),
+        password: this.password
+      };
+
+      console.log('开始注册请求:', registerData.username);
+      const response = await apiService.register(registerData);
+
+      if (response.success && response.data) {
+        // 注册成功，保存token
+        if (response.data.token) {
+          apiService.setToken(response.data.token);
+          console.log('✅ Token已保存');
+        }
+
+        // 更新用户信息
+        this.userProfile = {
+          id: response.data.user.id,
+          username: response.data.user.username,
+          email: response.data.user.email,
+          phone: response.data.user.phone || '',
+          avatar: response.data.user.avatar || '👤',
+          bio: response.data.user.bio || '智慧农业用户',
+          user_mode: response.data.user.user_mode,
+          is_admin: response.data.user.is_admin || 0  // ✅ 保存管理员标识
+        };
+
+        console.log('✅ 注册成功:', this.userProfile.username);
+        this.successMessage = '注册成功！';
+
+        // 延迟1秒后跳转（给UI时间渲染）
+        setTimeout(() => {
+          this.isLoggedIn = true;
+          this.userMode = 'logged_in';
+          this.currentView = 'main';
+          this.clearForm();
+          this.successMessage = ''; // 清除成功消息
+          console.log('✅ 已跳转到主界面');
+        }, 1000);
+
+      } else {
+        // 注册失败
+        this.errorMessage = response.message || '注册失败，请检查输入信息';
+        console.error('注册失败:', response.message);
+      }
+    } catch (error) {
+      console.error('注册异常:', error);
+      this.errorMessage = '网络连接失败，请检查网络设置';
+    } finally {
+      this.isLoading = false;
+    }
+  }
+
+  // 处理退出登录
+  private async handleLogout(): Promise<void> {
+    this.isLoading = true;
+
+    try {
+      console.log('开始登出请求');
+      const response = await apiService.logout();
+
+      if (response.success) {
+        console.log('登出成功');
+      } else {
+        console.warn('登出请求失败，但继续清除本地状态');
+      }
+    } catch (error) {
+      console.error('登出异常:', error);
+    } finally {
+      // 无论服务器响应如何，都清除本地状态
+      this.isLoggedIn = false;
+      this.userMode = 'not_logged_in';
+      this.currentView = 'login';
+      this.userProfile = {
+        id: 0,
+        username: '',
+        email: '',
+        phone: '',
+        avatar: '👤',
+        bio: '智慧农业用户',
+        user_mode: 'not_logged_in',
+        is_admin: 0  // ✅ 重置管理员标识
+      };
+      this.clearForm();
+      this.isLoading = false;
+    }
+  }
+
+  // 处理游客模式进入
+  private handleGuestMode(): void {
+    console.log('以游客模式进入应用');
+    this.isLoggedIn = false;
+    this.userMode = 'guest';
+    this.currentView = 'main';
+    this.clearForm();
+  }
+
+  // 清空表单
+  private clearForm(): void {
+    this.username = '';
+    this.password = '';
+    this.confirmPassword = '';
+    this.email = '';
+    this.phone = '';
+    this.errorMessage = '';
+    this.successMessage = '';
+  }
+
+  // 切换到注册页面
+  private switchToRegister(): void {
+    this.currentView = 'register';
+    this.clearForm();
+  }
+
+  // 切换到登录页面
+  private switchToLogin(): void {
+    this.currentView = 'login';
+    this.clearForm();
+  }
+
+  // 登录页面内容组件
+  @Builder
+  LoginPageContent() {
+    Column() {
+      // 顶部标题区域
+      Column() {
+        // Logo图标
+        Image($rawfile('登录.png'))
+          .width(80)
+          .height(80)
+          .fillColor('#007AFF')
+          .margin({ bottom: 16 })
+
+        Text('欢迎回来')
+          .fontSize(32)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#1a1a1a')
+          .margin({ bottom: 8 })
+
+        Text('登录智慧农业管理系统')
+          .fontSize(16)
+          .fontColor('#666666')
+          .margin({ bottom: 48 })
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Center)
+      .margin({ top: 80, bottom: 32 })
+
+      // 登录表单区域
+      Column() {
+        // 用户名输入框
+        Column() {
+          Text('用户名')
+            .fontSize(14)
+            .fontColor('#666666')
+            .fontWeight(FontWeight.Medium)
+            .alignSelf(ItemAlign.Start)
+            .margin({ bottom: 8, left: 4 })
+
+          TextInput({ placeholder: '请输入用户名' })
+            .width('100%')
+            .height(52)
+            .backgroundColor('#FFFFFF')
+            .borderRadius(26)
+            .padding({ left: 20, right: 20 })
+            .fontSize(16)
+            .placeholderColor('#BBBBBB')
+            .border({ width: 1, color: '#E5E5E5' })
+            .shadow({
+              radius: 8,
+              color: 'rgba(0, 0, 0, 0.04)',
+              offsetX: 0,
+              offsetY: 2
+            })
+            .onChange((value: string) => {
+              this.username = value;
+            })
+        }
+        .width('100%')
+        .margin({ bottom: 20 })
+
+        // 密码输入框
+        Column() {
+          Text('密码')
+            .fontSize(14)
+            .fontColor('#666666')
+            .fontWeight(FontWeight.Medium)
+            .alignSelf(ItemAlign.Start)
+            .margin({ bottom: 8, left: 4 })
+
+          TextInput({ placeholder: '请输入密码' })
+            .width('100%')
+            .height(52)
+            .backgroundColor('#FFFFFF')
+            .borderRadius(26)
+            .padding({ left: 20, right: 20 })
+            .fontSize(16)
+            .placeholderColor('#BBBBBB')
+            .type(InputType.Password)
+            .border({ width: 1, color: '#E5E5E5' })
+            .shadow({
+              radius: 8,
+              color: 'rgba(0, 0, 0, 0.04)',
+              offsetX: 0,
+              offsetY: 2
+            })
+            .onChange((value: string) => {
+              this.password = value;
+            })
+        }
+        .width('100%')
+        .margin({ bottom: 32 })
+
+        // 错误信息显示
+        if (this.errorMessage) {
+          Row() {
+            Text('⚠️')
+              .fontSize(16)
+              .margin({ right: 6 })
+            Text(this.errorMessage)
+              .fontSize(14)
+              .fontColor('#FF4444')
+          }
+          .width('100%')
+          .padding(12)
+          .backgroundColor('#FFF5F5')
+          .borderRadius(12)
+          .margin({ bottom: 20 })
+        }
+
+        // 成功信息显示
+        if (this.successMessage) {
+          Row() {
+            Text('✓')
+              .fontSize(16)
+              .fontColor('#00AA00')
+              .margin({ right: 6 })
+            Text(this.successMessage)
+              .fontSize(14)
+              .fontColor('#00AA00')
+          }
+          .width('100%')
+          .padding(12)
+          .backgroundColor('#F0FFF4')
+          .borderRadius(12)
+          .margin({ bottom: 20 })
+        }
+
+        // 登录按钮 - 渐变椭圆
+        Stack() {
+          // 渐变背景
+          if (!this.isLoading) {
+            Column()
+              .width('100%')
+              .height(56)
+              .borderRadius(28)
+              .linearGradient({
+                angle: 135,
+                colors: [['#4facfe', 0.0], ['#00f2fe', 1.0]]
+              })
+              .shadow({
+                radius: 16,
+                color: 'rgba(79, 172, 254, 0.4)',
+                offsetX: 0,
+                offsetY: 8
+              })
+          } else {
+            Column()
+              .width('100%')
+              .height(56)
+              .borderRadius(28)
+              .backgroundColor('#CCCCCC')
+          }
+          
+          // 按钮内容
+          Button({ type: ButtonType.Normal }) {
+            Row() {
+              if (!this.isLoading) {
+                Image($rawfile('登录.png'))
+                  .width(22)
+                  .height(22)
+                  .fillColor('#FFFFFF')
+                  .margin({ right: 8 })
+              }
+              Text(this.isLoading ? '登录中...' : '立即登录')
+                .fontSize(17)
+                .fontColor('#FFFFFF')
+                .fontWeight(FontWeight.Medium)
+            }
+            .justifyContent(FlexAlign.Center)
+          }
+          .width('100%')
+          .height(56)
+          .backgroundColor('transparent')
+          .borderRadius(28)
+          .enabled(!this.isLoading)
+          .onClick(() => {
+            this.handleLogin();
+          })
+        }
+        .margin({ bottom: 16 })
+
+        // 跳过登录按钮 - 椭圆边框
+        Button('稍后登录，以游客身份使用')
+          .width('100%')
+          .height(52)
+          .backgroundColor('transparent')
+          .borderRadius(26)
+          .fontSize(15)
+          .fontColor('#4facfe')
+          .fontWeight(FontWeight.Medium)
+          .border({ width: 1.5, color: '#4facfe' })
+          .onClick(() => {
+            this.handleGuestMode();
+          })
+          .margin({ bottom: 24 })
+
+        // 注册链接
+        Row() {
+          Text('还没有账号？')
+            .fontSize(15)
+            .fontColor('#999999')
+            .margin({ right: 4 })
+
+          Text('立即注册')
+            .fontSize(15)
+            .fontColor('#4facfe')
+            .fontWeight(FontWeight.Medium)
+            .onClick(() => {
+              this.switchToRegister();
+            })
+        }
+        .justifyContent(FlexAlign.Center)
+        .padding(12)
+      }
+      .width('100%')
+      .padding({ left: 32, right: 32 })
+    }
+    .width('100%')
+    .height('100%')
+    .linearGradient({
+      angle: 180,
+      colors: [['#FFFFFF', 0.0], ['#F8FCFF', 0.5], ['#EBF4FF', 1.0]]
+    })
+    .justifyContent(FlexAlign.Start)
+  }
+
+  // 注册页面内容组件
+  @Builder
+  RegisterPageContent() {
+    Column() {
+      // 顶部返回按钮
+      Row() {
+        Button() {
+          Row() {
+            Text('←')
+              .fontSize(20)
+              .fontColor('#4facfe')
+              .margin({ right: 4 })
+            Text('返回登录')
+              .fontSize(16)
+              .fontColor('#4facfe')
+              .fontWeight(FontWeight.Medium)
+          }
+        }
+        .backgroundColor(Color.Transparent)
+        .onClick(() => {
+          this.switchToLogin();
+        })
+
+        Blank()
+      }
+      .width('100%')
+      .padding({ left: 20, right: 20, top: 24 })
+
+      // 顶部标题区域
+      Column() {
+        // Logo图标
+        Image($rawfile('注册.png'))
+          .width(60)
+          .height(60)
+          .fillColor('#007AFF')
+          .margin({ bottom: 12 })
+
+        Text('创建账户')
+          .fontSize(30)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#1a1a1a')
+          .margin({ bottom: 6 })
+
+        Text('加入智慧农业管理系统')
+          .fontSize(15)
+          .fontColor('#666666')
+          .margin({ bottom: 36 })
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Center)
+      .margin({ top: 32, bottom: 24 })
+
+      // 注册表单区域
+      Scroll() {
+        Column() {
+          // 用户名输入框
+          Column() {
+            Text('用户名')
+              .fontSize(14)
+              .fontColor('#666666')
+              .fontWeight(FontWeight.Medium)
+              .alignSelf(ItemAlign.Start)
+              .margin({ bottom: 8, left: 4 })
+
+            TextInput({ placeholder: '请输入用户名' })
+              .width('100%')
+              .height(50)
+              .backgroundColor('#FFFFFF')
+              .borderRadius(25)
+              .padding({ left: 20, right: 20 })
+              .fontSize(15)
+              .placeholderColor('#BBBBBB')
+              .border({ width: 1, color: '#E5E5E5' })
+              .shadow({
+                radius: 8,
+                color: 'rgba(0, 0, 0, 0.04)',
+                offsetX: 0,
+                offsetY: 2
+              })
+              .onChange((value: string) => {
+                this.username = value;
+              })
+          }
+          .width('100%')
+          .margin({ bottom: 16 })
+
+          // 手机号输入框
+          Column() {
+            Text('手机号')
+              .fontSize(14)
+              .fontColor('#666666')
+              .fontWeight(FontWeight.Medium)
+              .alignSelf(ItemAlign.Start)
+              .margin({ bottom: 8, left: 4 })
+
+            TextInput({ placeholder: '请输入手机号' })
+              .width('100%')
+              .height(50)
+              .backgroundColor('#FFFFFF')
+              .borderRadius(25)
+              .padding({ left: 20, right: 20 })
+              .fontSize(15)
+              .placeholderColor('#BBBBBB')
+              .type(InputType.PhoneNumber)
+              .border({ width: 1, color: '#E5E5E5' })
+              .shadow({
+                radius: 8,
+                color: 'rgba(0, 0, 0, 0.04)',
+                offsetX: 0,
+                offsetY: 2
+              })
+              .onChange((value: string) => {
+                this.phone = value;
+              })
+          }
+          .width('100%')
+          .margin({ bottom: 16 })
+
+          // 邮箱输入框
+          Column() {
+            Text('邮箱')
+              .fontSize(14)
+              .fontColor('#666666')
+              .fontWeight(FontWeight.Medium)
+              .alignSelf(ItemAlign.Start)
+              .margin({ bottom: 8, left: 4 })
+
+            TextInput({ placeholder: '请输入邮箱地址' })
+              .width('100%')
+              .height(50)
+              .backgroundColor('#FFFFFF')
+              .borderRadius(25)
+              .padding({ left: 20, right: 20 })
+              .fontSize(15)
+              .placeholderColor('#BBBBBB')
+              .type(InputType.Email)
+              .border({ width: 1, color: '#E5E5E5' })
+              .shadow({
+                radius: 8,
+                color: 'rgba(0, 0, 0, 0.04)',
+                offsetX: 0,
+                offsetY: 2
+              })
+              .onChange((value: string) => {
+                this.email = value;
+              })
+          }
+          .width('100%')
+          .margin({ bottom: 16 })
+
+        // 密码输入框
+        Column() {
+          Text('密码')
+            .fontSize(14)
+            .fontColor('#333333')
+            .alignSelf(ItemAlign.Start)
+            .margin({ bottom: 8 })
+
+          TextInput({ placeholder: '请输入密码（至少6位）' })
+            .width('100%')
+            .height(48)
+            .backgroundColor('#F8F8F8')
+            .borderRadius(8)
+            .padding({ left: 16, right: 16 })
+            .fontSize(16)
+            .type(InputType.Password)
+            .onChange((value: string) => {
+              this.password = value;
+            })
+        }
+        .width('100%')
+        .margin({ bottom: 16 })
+
+        // 确认密码输入框
+        Column() {
+          Text('确认密码')
+            .fontSize(14)
+            .fontColor('#333333')
+            .alignSelf(ItemAlign.Start)
+            .margin({ bottom: 8 })
+
+          TextInput({ placeholder: '请再次输入密码' })
+            .width('100%')
+            .height(48)
+            .backgroundColor('#F8F8F8')
+            .borderRadius(8)
+            .padding({ left: 16, right: 16 })
+            .fontSize(16)
+            .type(InputType.Password)
+            .onChange((value: string) => {
+              this.confirmPassword = value;
+            })
+        }
+        .width('100%')
+        .margin({ bottom: 20 })
+
+        // 错误信息显示
+        if (this.errorMessage) {
+          Text(this.errorMessage)
+            .fontSize(14)
+            .fontColor('#FF4444')
+            .margin({ bottom: 20 })
+        }
+
+        // 成功信息显示
+        if (this.successMessage) {
+          Column() {
+            Text(this.successMessage)
+              .fontSize(14)
+              .fontColor('#00AA00')
+              .margin({ bottom: 12 })
+
+            // 返回登录按钮
+            Button('返回登录')
+              .width('100%')
+              .height(48)
+              .backgroundColor('#00AA00')
+              .borderRadius(8)
+              .fontSize(16)
+              .fontColor('#FFFFFF')
+              .onClick(() => {
+                this.switchToLogin();
+              })
+          }
+          .width('100%')
+          .margin({ bottom: 20 })
+        }
+
+          // 注册按钮 - 渐变椭圆
+          if (!this.successMessage) {
+            Stack() {
+              // 渐变背景
+              if (!this.isLoading) {
+                Column()
+                  .width('100%')
+                  .height(54)
+                  .borderRadius(27)
+                  .linearGradient({
+                    angle: 135,
+                    colors: [['#a8e063', 0.0], ['#56ab2f', 1.0]]
+                  })
+                  .shadow({
+                    radius: 16,
+                    color: 'rgba(86, 171, 47, 0.4)',
+                    offsetX: 0,
+                    offsetY: 8
+                  })
+              } else {
+                Column()
+                  .width('100%')
+                  .height(54)
+                  .borderRadius(27)
+                  .backgroundColor('#CCCCCC')
+              }
+              
+              // 按钮内容
+              Button({ type: ButtonType.Normal }) {
+                Row() {
+                  if (!this.isLoading) {
+                    Image($rawfile('注册.png'))
+                      .width(22)
+                      .height(22)
+                      .fillColor('#FFFFFF')
+                      .margin({ right: 8 })
+                  }
+                  Text(this.isLoading ? '注册中...' : '立即注册')
+                    .fontSize(17)
+                    .fontColor('#FFFFFF')
+                    .fontWeight(FontWeight.Medium)
+                }
+                .justifyContent(FlexAlign.Center)
+              }
+              .width('100%')
+              .height(54)
+              .backgroundColor('transparent')
+              .borderRadius(27)
+              .enabled(!this.isLoading)
+              .onClick(() => {
+                this.handleRegister();
+              })
+            }
+            .margin({ bottom: 20 })
+          }
+
+          // 登录链接
+          Row() {
+            Text('已有账号？')
+              .fontSize(15)
+              .fontColor('#999999')
+              .margin({ right: 4 })
+
+            Text('立即登录')
+              .fontSize(15)
+              .fontColor('#56ab2f')
+              .fontWeight(FontWeight.Medium)
+              .onClick(() => {
+                this.switchToLogin();
+              })
+          }
+          .justifyContent(FlexAlign.Center)
+          .padding(12)
+        }
+        .width('100%')
+        .padding({ left: 32, right: 32 })
+      }
+      .layoutWeight(1)
+    }
+    .width('100%')
+    .height('100%')
+    .linearGradient({
+      angle: 180,
+      colors: [['#FFFFFF', 0.0], ['#F8FFF5', 0.5], ['#EBF5E8', 1.0]]
+    })
+    .justifyContent(FlexAlign.Start)
+  }
+
+  // ==============================================
+  // 🔥 AI智能分析相关方法
+  // ==============================================
+
+  // 初始化AI服务
+  initAIService() {
+    console.info('[AI] 初始化AI服务');
+
+    // 🔥 使用配置文件中的默认配置（无需传参）
+    cozeService.init();
+
+    // 获取快速问题
+    this.aiQuickQuestions = cozeService.getQuickReplies();
+
+    // 添加欢迎消息
+    this.addWelcomeMessage();
+  }
+
+  // 添加欢迎消息
+  addWelcomeMessage() {
+    const welcomeMsg: AIMessage = {
+      role: 'assistant',
+      content: '你好！我是智慧农场AI助手🌾\n\n我可以：\n• 分析实时传感器数据\n• 提供种植建议\n• 回答农业问题\n• 给出优化方案\n\n请告诉我你想了解什么？',
+      timestamp: Date.now()
+    };
+    this.aiMessages.push(welcomeMsg);
+  }
+
+  // 发送AI消息
+  async sendAIMessage(userText: string) {
+    console.info('[AI] 发送消息:', userText);
+
+    // 构建完整消息（包含传感器数据上下文）
+    let fullMessage = userText;
+
+    // 如果有传感器数据，自动附加到消息中
+    if (this.temperature > 0 || this.soilHumidity > 0 || this.lightIntensity > 0) {
+      fullMessage += `\n\n【当前环境数据】`;
+      if (this.temperature > 0) {
+        fullMessage += `\n温度: ${this.temperature}°C`;
+      }
+      if (this.soilHumidity > 0) {
+        fullMessage += `\n湿度: ${this.soilHumidity}%`;
+      }
+      if (this.lightIntensity > 0) {
+        fullMessage += `\n光照: ${this.lightIntensity}Lx`;
+      }
+    }
+
+    // 添加用户消息（显示原始消息，不显示传感器数据）
+    const userMsg: AIMessage = {
+      role: 'user',
+      content: userText,
+      timestamp: Date.now()
+    };
+    this.aiMessages.push(userMsg);
+
+    // 滚动到底部
+    setTimeout(() => {
+      this.aiChatScroller.scrollEdge(Edge.Bottom);
+    }, 100);
+
+    // 显示加载状态
+    this.isAILoading = true;
+
+    // 创建AI消息占位符（用于流式更新）
+    const assistantMsg: AIMessage = {
+      role: 'assistant',
+      content: '', // 初始为空，流式更新
+      timestamp: Date.now()
+    };
+    this.aiMessages.push(assistantMsg);
+    const aiMessageIndex = this.aiMessages.length - 1; // 记录索引
+
+    // 调用Coze AI服务（流式输出）
+    await cozeService.sendMessage(
+      fullMessage,
+      // onUpdate: 实时更新回调
+      (deltaContent: string) => {
+        console.info('[AI] 📝 收到增量:', deltaContent);
+        
+        // 🔥 修复：更新内容并触发UI刷新
+        this.aiMessages[aiMessageIndex].content += deltaContent;
+        
+        // 强制触发响应式更新（重新赋值数组）
+        this.aiMessages = [...this.aiMessages];
+
+        // 滚动到底部（显示最新内容）
+        setTimeout(() => {
+          this.aiChatScroller.scrollEdge(Edge.Bottom);
+        }, 50);
+      },
+      // onComplete: 完成回调
+      (fullContent: string) => {
+        console.info('[AI] ✅ 完成，总长度:', fullContent.length);
+        this.isAILoading = false;
+
+        // 确保显示完整内容（防止增量更新丢失）
+        if (fullContent && this.aiMessages[aiMessageIndex].content !== fullContent) {
+          this.aiMessages[aiMessageIndex].content = fullContent;
+        }
+
+        // 如果没有内容，设置错误提示
+        if (!this.aiMessages[aiMessageIndex].content) {
+          this.aiMessages[aiMessageIndex].content = '抱歉，AI暂时没有回复。';
+        }
+
+        // 🔥 强制触发响应式更新
+        this.aiMessages = [...this.aiMessages];
+
+        // 最后滚动
+        setTimeout(() => {
+          this.aiChatScroller.scrollEdge(Edge.Bottom);
+        }, 100);
+      },
+      // onError: 错误回调
+      (error: string) => {
+        console.error('[AI] ❌ 错误:', error);
+        this.isAILoading = false;
+        this.aiMessages[aiMessageIndex].content = `错误: ${error}`;
+        
+        // 🔥 强制触发响应式更新
+        this.aiMessages = [...this.aiMessages];
+      }
+    );
+
+    // 滚动到底部
+    setTimeout(() => {
+      this.aiChatScroller.scrollEdge(Edge.Bottom);
+    }, 100);
+  }
+
+  // AI消息组件
+  @Builder
+  AIMessageItem(msg: AIMessage, index: number) {
+    Row() {
+      if (msg.role === 'assistant') {
+        Image($rawfile('deepseek-copy-copy-copy.png'))
+          .width(36)
+          .height(36)
+          .borderRadius(18)
+          .margin({ right: 12 })
+      } else {
+        Blank()
+      }
+
+      Text(msg.content)
+        .fontSize(15)
+        .fontColor(msg.role === 'user' ? '#FFFFFF' : '#333333')
+        .padding({
+          left: 16,
+          right: 16,
+          top: 12,
+          bottom: 12
+        })
+        .backgroundColor(msg.role === 'user' ? '#667eea' : '#F0F0F0')
+        .borderRadius(18)
+        .constraintSize({ maxWidth: '75%' })
+
+      if (msg.role === 'user') {
+        Image($rawfile('B站狗头.png'))
+          .width(36)
+          .height(36)
+          .borderRadius(18)
+          .margin({ left: 12 })
+      } else {
+        Blank()
+      }
+    }
+    .width('100%')
+    .alignItems(VerticalAlign.Top)
+    .margin({ top: 0, bottom: 12 })
+  }
+
+  // 获取天气描述
+  getWeatherDescription(): string {
+    if (this.temperature === 0 && this.soilHumidity === 0) {
+      return '等待数据...';
+    }
+
+    if (this.temperature > 30) {
+      return '炎热天气';
+    } else if (this.temperature > 25) {
+      return '温暖天气';
+    } else if (this.temperature > 18) {
+      return '舒适天气';
+    } else if (this.temperature > 10) {
+      return '凉爽天气';
+    } else {
+      return '寒冷天气';
+    }
+  }
+
+  // 获取天气图标
+  getWeatherIcon(): string {
+    if (this.temperature === 0 && this.soilHumidity === 0) {
+      return '⏳';
+    }
+
+    // 根据光照强度判断天气
+    if (this.lightIntensity > 800) {
+      return '☀️'; // 晴天
+    } else if (this.lightIntensity > 500) {
+      return '🌤️'; // 多云
+    } else if (this.lightIntensity > 200) {
+      return '☁️'; // 阴天
+    } else {
+      return '🌧️'; // 雨天/夜晚
+    }
+  }
+}
