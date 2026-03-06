@@ -1,0 +1,46 @@
+[2025-10-25 13:54:36] [INFO] API访问: GET / - IP: 182.118.238.122
+[2025-10-25 13:55:30] [INFO] API访问: GET / - IP: 100.29.190.242
+[2025-10-25 13:57:00] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 182.118.238.122
+[2025-10-25 13:57:44] [INFO] API访问: GET /sensor_data/endpoints/upload - IP: 182.118.238.122
+[2025-10-25 14:00:19] [INFO] API访问: GET /sensor_data/endpoints/upload - IP: 100.29.190.242
+[2025-10-25 14:06:53] [INFO] API访问: GET /sensor_data/endpoints/upload - IP: 182.118.238.122
+[2025-10-25 14:06:59] [INFO] API访问: GET /sensor_data/endpoints/upload - IP: 182.118.238.122
+[2025-10-25 14:08:49] [INFO] API访问: GET /sensor_data/endpoints/upload - IP: 100.29.190.242
+[2025-10-25 14:09:54] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 182.118.238.122
+[2025-10-25 14:11:53] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 18.207.155.212
+[2025-10-25 14:11:53] [INFO] API访问: GET /sensor_data/endpoints/query - IP: 100.29.190.242
+[2025-10-25 14:11:54] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 54.208.119.170
+[2025-10-25 14:21:15] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 182.118.238.122
+[2025-10-25 14:21:30] [INFO] API访问: GET /sensor_data/endpoints/query - IP: 182.118.238.122
+[2025-10-25 14:21:38] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 182.118.238.122
+[2025-10-25 14:21:45] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 182.118.238.122
+[2025-10-25 14:26:12] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 182.118.238.122
+[2025-10-25 14:26:17] [INFO] API访问: GET /sensor_data/endpoints/query - IP: 182.118.238.122
+[2025-10-25 14:26:21] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 182.118.238.122
+[2025-10-25 14:45:13] [INFO] API访问: GET /sensor_data/endpoints/query - IP: 182.118.238.122
+[2025-10-25 14:54:19] [INFO] API访问: GET / - IP: 182.118.238.122
+[2025-10-25 15:15:55] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 182.118.239.179
+[2025-10-25 15:16:35] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 182.118.238.122
+[2025-10-25 15:16:39] [INFO] API访问: GET /sensor_data/endpoints/query - IP: 182.118.238.122
+[2025-10-25 15:16:43] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 182.118.238.122
+[2025-10-25 15:38:36] [INFO] API访问: GET /sensor_data/endpoints/query - IP: 36.40.169.204
+[2025-10-25 15:41:32] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 182.118.238.122
+[2025-10-25 15:49:09] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 64.81.29.32
+[2025-10-25 15:57:27] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 18.207.155.212
+[2025-10-25 16:22:01] [INFO] API访问: GET /sensor_data/endpoints/latest/1_3242 - IP: 121.30.179.56
+[2025-10-25 16:22:01] [WARNING] 未找到端点: /sensor_data/endpoints/latest/1_3242
+[2025-10-25 16:24:32] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 52.80.110.156
+[2025-10-25 16:24:34] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 101.126.59.25
+[2025-10-25 19:56:31] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 182.118.238.122
+[2025-10-25 19:56:42] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 182.118.238.122
+[2025-10-25 19:56:59] [INFO] API访问: GET /sensor_data/endpoints/query - IP: 52.80.231.143
+[2025-10-25 19:57:01] [INFO] API访问: GET /sensor_data/endpoints/query - IP: 123.58.10.201
+[2025-10-25 20:06:46] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 100.29.190.242
+[2025-10-25 20:07:03] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 100.29.190.242
+[2025-10-25 20:20:37] [INFO] API访问: POST /login - IP: 182.118.238.122
+[2025-10-25 20:20:38] [INFO] 用户登录成功: admin (ID: 3)
+[2025-10-25 20:26:13] [INFO] API访问: POST /login - IP: 182.118.238.122
+[2025-10-25 20:26:14] [INFO] 用户登录成功: admin (ID: 3)
+[2025-10-25 20:32:16] [INFO] API访问: POST /login - IP: 182.118.238.122
+[2025-10-25 20:32:17] [INFO] 用户登录成功: admin (ID: 3)
+[2025-10-25 22:53:00] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 120.233.33.150

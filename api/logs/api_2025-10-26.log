@@ -1,0 +1,22 @@
+[2025-10-26 00:12:50] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 183.60.225.228
+[2025-10-26 11:39:49] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 182.118.236.168
+[2025-10-26 11:39:59] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 182.118.236.168
+[2025-10-26 11:40:09] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 182.118.236.168
+[2025-10-26 12:58:53] [INFO] API访问: POST /login - IP: 182.118.236.168
+[2025-10-26 12:58:54] [INFO] 用户登录成功: admin (ID: 3)
+[2025-10-26 14:40:41] [INFO] API访问: GET /sensor_data/endpoints/latest - IP: 129.204.116.160
+[2025-10-26 15:38:14] [INFO] API访问: POST /login - IP: 182.118.236.168
+[2025-10-26 15:38:15] [INFO] 用户登录成功: admin (ID: 3)
+[2025-10-26 16:46:38] [INFO] API访问: GET /sensor_data/endpoints/stats - IP: 129.204.31.216
+[2025-10-26 16:57:33] [INFO] API访问: POST /login - IP: 182.118.236.168
+[2025-10-26 16:57:34] [INFO] 用户登录成功: admin (ID: 3)
+[2025-10-26 16:57:36] [INFO] API访问: POST /logout - IP: 182.118.236.168
+[2025-10-26 16:57:36] [WARNING] 未找到端点: /logout
+[2025-10-26 16:57:47] [INFO] API访问: POST /login - IP: 182.118.236.168
+[2025-10-26 16:57:49] [INFO] 用户登录成功: admin (ID: 3)
+[2025-10-26 19:30:12] [INFO] API访问: POST /login - IP: 182.118.236.168
+[2025-10-26 19:30:14] [INFO] 用户登录成功: admin (ID: 3)
+[2025-10-26 19:38:56] [INFO] API访问: POST /register - IP: 182.118.236.168
+[2025-10-26 19:38:57] [INFO] 用户注册成功: xcc (ID: 9)
+[2025-10-26 19:39:30] [INFO] API访问: POST /login - IP: 182.118.236.168
+[2025-10-26 19:39:31] [INFO] 用户登录成功: xcc (ID: 9)

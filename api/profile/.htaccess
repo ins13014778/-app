@@ -1,0 +1,11 @@
+# Profile目录配置
+# 允许访问所有PHP文件
+<Files "*.php">
+    Require all granted
+</Files>
+
+# 允许POST请求
+<Limit POST>
+    Require all granted
+</Limit>
+
